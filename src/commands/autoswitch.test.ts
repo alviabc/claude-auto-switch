@@ -566,6 +566,9 @@ describe('ccx autoswitch run', () => {
 
   it('ends when a newer ccx is installed, so its service starts it again on that one', async () => {
     loop(10);
+    // Where a service starts it again, which is everywhere but Windows: said
+    // here, so the test means the same whatever machine runs it.
+    s.deps.restartsOnExit = true;
     s.deps.newerInstall = () => ({ version: '99.0.0', cli: '/somewhere/cli.js' });
     expect(await s.run('run')).toBe(0);
     expect(s.world.probed).toEqual(['work']);
