@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { ensureLoginUsable, readinessMessage, swapMode } from './preflight.js';
+import { ensureLoginUsable, readinessMessage } from './preflight.js';
 
 function deps(over: Partial<Parameters<typeof ensureLoginUsable>[0]> = {}) {
   return {
@@ -11,6 +11,18 @@ function deps(over: Partial<Parameters<typeof ensureLoginUsable>[0]> = {}) {
 }
 
 describe('ensureLoginUsable', () => {
+  it('does not count a renewal another caller made as one of its own', async () => {
+    // Joined while that renewal was under way: it was written down by the
+    // caller that made it, and must not be logged again here.
+    const r = await ensureLoginUsable(
+      deps({
+        renewalDue: () => true,
+        renew: () => Promise.resolve({ status: 'refreshed', alreadyKnown: true }),
+      }),
+    );
+    expect(r.state).toBe('ready');
+  });
+
   it('does nothing when the login is fine', async () => {
     let renewed = false;
     const r = await ensureLoginUsable(
@@ -80,23 +92,5 @@ describe('ensureLoginUsable', () => {
     // actually matters.
     expect(readinessMessage('main', { state: 'ready' })).toBeNull();
     expect(readinessMessage('main', { state: 'renewed' })).toBeNull();
-  });
-});
-
-describe('swapMode', () => {
-  it('swaps in place when the target login is usable right now', () => {
-    expect(swapMode({ hasLogin: () => true, renewalDue: () => false })).toBe('in-place');
-  });
-
-  it('relaunches instead when the target login needs renewing', () => {
-    // The swap is synchronous, so nothing can be renewed during it. Swapping an
-    // expired login under a running Claude lands it on a dead token, which is the
-    // same sudden sign-out the pre-flight exists to prevent. Relaunching with
-    // --continue keeps the conversation and lets the start path renew first.
-    expect(swapMode({ hasLogin: () => true, renewalDue: () => true })).toBe('restart');
-  });
-
-  it('relaunches when the target has no login at all', () => {
-    expect(swapMode({ hasLogin: () => false, renewalDue: () => false })).toBe('restart');
   });
 });
