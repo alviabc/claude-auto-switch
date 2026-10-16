@@ -2,12 +2,15 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { refreshUsage, readUsageSnapshot } from './usage-store.js';
+import { recordUsageReading, refreshUsage, readUsageSnapshot, renewIdleLogin } from './usage-store.js';
+import { renewOneAtATime } from './renew-one-at-a-time.js';
 import type { LimitProbeResult } from './limit-probe.js';
 import { readCredentialEvents } from '../accounts/credential-log.js';
 import { takeLease } from '../session/lease.js';
 import { rememberDeadLogin } from './dead-login-store.js';
 import { credentialFileFingerprint } from '../accounts/credential-vault.js';
+import { readEvents } from '../events/log.js';
+import { configHome } from '../config/paths.js';
 
 function setup(names: string[]) {
   const home = mkdtempSync(path.join(tmpdir(), 'cas-usage-'));
@@ -49,6 +52,19 @@ describe('refreshUsage', () => {
     expect(snap.accounts['a']?.sevenDayReset).toBe(2_000);
     // Persisted: a fresh read sees the same data.
     expect(readUsageSnapshot(c).accounts['b']?.sevenDay).toBe(0.6);
+  });
+
+  it('writes one renewal down once, when two callers share it', async () => {
+    const { c, accounts } = setup(['a']);
+    const oneAtATime = renewOneAtATime();
+    const renew = () =>
+      oneAtATime('the one login', () => new Promise((resolve) => setTimeout(() => resolve({ status: 'refreshed' }), 20)));
+    await Promise.all([
+      renewIdleLogin(accounts[0]!, accounts, c, { renew, editorAccount: null }),
+      renewIdleLogin(accounts[0]!, accounts, c, { renew, editorAccount: null }),
+    ]);
+    // Repeats are folded into one entry with a count, so the count is what says it.
+    expect(readCredentialEvents(10, c).map((e) => [e.kind, e.count ?? 1])).toEqual([['renewed', 1]]);
   });
 
   it('records renewals in the credential log, so a lost login is explainable', async () => {
@@ -187,9 +203,12 @@ describe('refreshUsage', () => {
       );
     }
 
-    it('is NOT renewed while it could still be in use', async () => {
-      // The editor reads the login directly, so ccx cannot see its session. This
-      // is the same failure as the terminal case: renewing signs the editor out.
+    it('IS renewed while the editor may be using it, since Claude renews it under the same lock', async () => {
+      // The editor's Claude reads this profile's login through the pointer and
+      // renews it under <config dir>/.oauth_refresh.lock, the lock ccx takes in
+      // this same folder, reading it again there and sending nothing when it
+      // changed (Claude Code 2.1.294 to 2.1.299). So a renewal by ccx is one
+      // the editor picks up rather than one that signs it out.
       const { c, accounts } = setup(['ide', 'other']);
       const home = c.env.CLAUDE_AUTO_SWITCH_HOME as string;
       expiredLogin(accounts[0]!.dir, 'ide', 1);
@@ -205,9 +224,9 @@ describe('refreshUsage', () => {
         },
       });
 
-      expect(renewed.some((d) => d.includes('ide'))).toBe(false);
-      expect(renewed.some((d) => d.includes('other'))).toBe(true); // not pointed at
-      expect(readCredentialEvents(10, c).some((e) => e.detail?.includes('editor'))).toBe(true);
+      expect(renewed.some((d) => d.includes('ide'))).toBe(true);
+      expect(renewed.some((d) => d.includes('other'))).toBe(true);
+      expect(readCredentialEvents(10, c).some((e) => e.detail?.includes('editor'))).toBe(false);
     });
 
     it('IS renewed once its login has been dead too long for anything to hold it', async () => {
@@ -512,11 +531,11 @@ describe('a shared login where only the OTHER profile is busy', () => {
     expect(renewed).toEqual([]);
   });
 
-  it('does not renew when the EDITOR is pointed at the profile that shares this login', async () => {
-    // The editor reads a login directly, so ccx cannot see its session. Renewing
-    // a sibling rotates the token the editor is using, and then carries it into
-    // the editor's own file mid-session. Before shared logins could be renewed
-    // at all, any sibling caused a refusal and this could not happen.
+  it('does not renew a profile that shares its login with the one the EDITOR is on', async () => {
+    // Renewing a sibling rotates the token the editor is using, under the
+    // sibling's own lock, which the editor's Claude does not take, and then
+    // carries it into the editor's own file mid-session. The profile the
+    // editor is on is renewed under the lock the editor's Claude takes too.
     const { c, accounts } = setup(['other', 'editor-one']);
     shareLogin([accounts[0]!.dir, accounts[1]!.dir], 'refresh-shared');
     const home = c.env.CLAUDE_AUTO_SWITCH_HOME as string;
@@ -537,7 +556,7 @@ describe('a shared login where only the OTHER profile is busy', () => {
 
     // Processing the NON-editor profile first is the case that used to slip
     // through: it is not the editor account itself, so nothing stopped it.
-    expect(renewed).toEqual([]);
+    expect(renewed).toEqual([accounts[1]!.dir]);
   });
 });
 
@@ -626,5 +645,122 @@ describe('whose login answers for an account, when a session is running', () => 
     });
 
     expect(probed[0]).toContain('anon-session');
+  });
+});
+
+describe('a reading filed by a caller that asked the endpoint itself', () => {
+  it('is stored with its own time, and the other accounts are left as they were', async () => {
+    const { c, accounts } = setup(['a', 'b']);
+    await refreshUsage(accounts, c, { probe: () => Promise.resolve(result(0.25, 0.6)), now: () => 1_000 });
+
+    expect(recordUsageReading('a', result(0.4, 0.61), c, 5_000)).toBe(true);
+
+    const snap = readUsageSnapshot(c);
+    expect(snap.accounts.a).toMatchObject({ fiveHour: 0.4, sevenDay: 0.61, fiveHourReset: 1_000, at: 5_000 });
+    expect(snap.accounts.b).toMatchObject({ fiveHour: 0.25, sevenDay: 0.6, at: 1_000 });
+  });
+
+  it('keeps the next refresh from asking again while it is fresh', async () => {
+    const { c, accounts } = setup(['a']);
+    recordUsageReading('a', result(0.4, 0.61), c, 5_000);
+    let probes = 0;
+    await refreshUsage(accounts, c, {
+      probe: () => {
+        probes += 1;
+        return Promise.resolve(result(0.9, 0.9));
+      },
+      now: () => 6_000,
+    });
+    expect(probes).toBe(0);
+    expect(readUsageSnapshot(c).accounts.a?.fiveHour).toBe(0.4);
+  });
+
+  it('drops a read that was turned away, rather than stamp an old number as new', async () => {
+    const { c, accounts } = setup(['a']);
+    await refreshUsage(accounts, c, { probe: () => Promise.resolve(result(0.25, 0.6)), now: () => 1_000 });
+
+    expect(recordUsageReading('a', { verdict: 'unknown', detail: 'status 429' }, c, 5_000)).toBe(false);
+
+    expect(readUsageSnapshot(c).accounts.a).toMatchObject({ fiveHour: 0.25, at: 1_000 });
+  });
+
+  it('keeps the per-model weeks the read carried', () => {
+    const { c } = setup(['a']);
+    recordUsageReading('a', { ...result(0.4, 0.61), models: [{ name: 'Fable', utilization: 0.7, resetsAt: 9_000 }] }, c, 5_000);
+    expect(readUsageSnapshot(c).accounts.a?.models).toEqual([{ name: 'Fable', utilization: 0.7, resetsAt: 9_000 }]);
+  });
+});
+
+describe('a login the usage endpoint turns away', () => {
+  const turnedAway: LimitProbeResult = {
+    verdict: 'unknown',
+    detail: 'status 401',
+    rejected: { message: 'OAuth access token has been revoked.', token: 'fp' },
+  };
+  /** A probe that answers each look with the next of `answers`, the last one for good. */
+  const answering = (...answers: LimitProbeResult[]) => {
+    let at = 0;
+    return () => Promise.resolve(answers[Math.min(at++, answers.length - 1)] as LimitProbeResult);
+  };
+
+  it('renews it at once, for the token turned away, and reads the usage again', async () => {
+    const { c, accounts } = setup(['a']);
+    const asked: Array<string | undefined> = [];
+    const snap = await refreshUsage(accounts, c, {
+      probe: answering(turnedAway, result(0.3, 0.4)),
+      renew: (_dir, rejected) => {
+        asked.push(rejected);
+        return Promise.resolve({ status: rejected ? 'refreshed' : 'not-needed' });
+      },
+    });
+    expect(asked).toEqual([undefined, 'fp']);
+    expect(snap.accounts['a']?.fiveHour).toBe(0.3);
+  });
+
+  it('says so where the dashboard shows it when the token endpoint refuses the login', async () => {
+    const { c, accounts } = setup(['a', 'b']);
+    await refreshUsage(accounts, c, {
+      probe: (file) => Promise.resolve(file.includes(`${path.sep}a${path.sep}`) ? turnedAway : result(0.1, 0.1)),
+      renew: (_dir, rejected) =>
+        Promise.resolve(
+          rejected
+            ? { status: 'needs-login', detail: 'token endpoint 400: {"error": "invalid_grant", "error_description": "account_on_hold"}' }
+            : { status: 'not-needed' },
+        ),
+    });
+    expect(readCredentialEvents(10, c).map((e) => [e.account, e.kind])).toEqual([['a', 'needs-login']]);
+    const said = readEvents(configHome(c), 10).filter((e) => e.kind === 'signed-out');
+    expect(said.map((e) => e.msg)).toEqual(['"a" is on hold at Anthropic (claude.ai/restricted), so it is out of rotation']);
+  });
+
+  it('says nothing more about a refusal that was already known', async () => {
+    const { c, accounts } = setup(['a']);
+    await refreshUsage(accounts, c, {
+      probe: answering(turnedAway),
+      renew: (_dir, rejected) =>
+        Promise.resolve(rejected ? { status: 'needs-login', detail: 'invalid_grant', alreadyKnown: true } : { status: 'not-needed' }),
+    });
+    expect(readEvents(configHome(c), 10).filter((e) => e.kind === 'signed-out')).toEqual([]);
+  });
+
+  it('never renews a login a running session is using, even when its token is turned away', async () => {
+    const { c, accounts } = setup(['busy']);
+    const sessionDir = path.join(c.env.CLAUDE_AUTO_SWITCH_HOME as string, 'live-session');
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      path.join(sessionDir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'tok-live', refreshToken: 'rt-live' } }),
+      'utf8',
+    );
+    takeLease('busy', sessionDir, c);
+    const asked: Array<string | undefined> = [];
+    await refreshUsage(accounts, c, {
+      probe: answering(turnedAway),
+      renew: (_dir, rejected) => {
+        asked.push(rejected);
+        return Promise.resolve({ status: 'refreshed' });
+      },
+    });
+    expect(asked).toEqual([]);
   });
 });

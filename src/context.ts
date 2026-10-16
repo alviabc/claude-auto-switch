@@ -3,7 +3,7 @@ import { resolveRealClaude } from './launcher/real-claude.js';
 import type { Config } from './config/config.schema.js';
 import type { PathCtx } from './config/paths.js';
 import type { ClaudeInvoker } from './invoker.js';
-import type { LimitVerdict } from './usage/limit-probe.js';
+import type { LimitProbeResult, LimitVerdict } from './usage/limit-probe.js';
 import type { BlockedWatchOptions } from './launcher/blocked-watch.js';
 import type { NewerInstall } from './update/newer-install.js';
 import type { CarryOnTiming } from './launcher/carry-on.js';
@@ -24,6 +24,12 @@ export interface CliContext {
    */
   capProbe?: ConfirmCapDeps['probe'];
   /**
+   * Injected in tests: stands in for the usage request that asks whether a
+   * stored login's token is still accepted (accounts/login-check), so no test
+   * sends a made-up token to Anthropic.
+   */
+  loginProbe?: (credentialsFile: string) => Promise<LimitProbeResult>;
+  /**
    * Injected in tests: how quickly a session counts as blocked. Production uses
    * the defaults in blocked-watch (three walls over two minutes), which no test
    * can wait for.
@@ -40,6 +46,18 @@ export interface CliContext {
    * newer ccx or a switch it cannot make in place. Production waits 20 s.
    */
   idleBeforeRestartMs?: number;
+  /**
+   * Injected in tests: how long a refused turn goes unchecked after a check
+   * that did not confirm a limit, or after a move in place. Production waits
+   * 20 s (launcher/pty-session).
+   */
+  refuteBackoffMs?: number;
+  /**
+   * Injected in tests: how long a login renewal for a switch that did not
+   * happen (another session using the login, an outage) waits before the same
+   * switch tries it again. Production waits 20 s.
+   */
+  moveRenewalRetryMs?: number;
   /** Injected in tests: overrides the API lookup of who a stored login belongs to. */
   lookupOwner?: (dir: string) => Promise<string | null>;
   /** Injected in tests: a newer ccx installed under this one (update/newer-install). */

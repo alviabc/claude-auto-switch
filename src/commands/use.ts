@@ -1,11 +1,14 @@
 import { getAccount } from '../accounts/registry.js';
 import { setActive } from '../state/active.js';
+import { recordHandPick } from '../state/hand-pick.js';
+import { withSwitchLock } from '../state/switch-lock.js';
 import { requestMoves, writeSwitchRequest } from '../state/switch-request.js';
 import { syncEditorPointerIfEnabled } from '../editor/junction.js';
 import { liveLeases, type SessionLease } from '../session/lease.js';
 import { resolveTarget } from '../session/session-target.js';
 import { numberSessions } from '../dashboard/session-choice.js';
 import type { CliContext } from '../context.js';
+import { takeBackMoves } from '../state/switch-request.js';
 
 export interface UseOptions {
   /** Instant switch by restarting the session (--continue) instead of the seamless swap. */
@@ -69,8 +72,15 @@ export function useCommand(
     return 0;
   }
 
-  setActive(name, context.ctx);
-  syncEditorPointerIfEnabled(context); // keep the editor in sync if it is on
+  // Under the lock the auto-switch watcher switches under, so the two never
+  // interleave. A person is never kept waiting on it: after two seconds the
+  // switch is made all the same.
+  withSwitchLock(context.ctx, { waitMs: 2_000 }, () => {
+    setActive(name, context.ctx);
+    syncEditorPointerIfEnabled(context); // keep the editor in sync if it is on
+  });
+  // Chosen by hand, which the watcher leaves alone while this account can run.
+  recordHandPick(name, context.ctx);
   context.out(`active account: ${name}`);
   // Each session is asked by its own request, never by one they all race for.
   const running = numberSessions(leases());
@@ -78,6 +88,8 @@ export function useCommand(
     context.out(`${running.length} sessions are running, so none was moved:`);
     for (const s of running) context.out(`  ${s.pid}  ${s.where} (on ${s.account})`);
     context.out(`move one with: ccx use ${name} --session <pid>   (or --here in its folder, or --all)`);
+    // None moves, and one already on it stays rather than make a move asked earlier.
+    takeBackMoves(name, running, context.ctx);
     return 0;
   }
   for (const s of requestMoves(name, running, mode, context.ctx)) {

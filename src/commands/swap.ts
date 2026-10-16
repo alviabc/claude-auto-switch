@@ -10,6 +10,8 @@ import { isSessionDir, pidOfSessionDir, processIsAlive } from '../session/sessio
 import { liveLeases } from '../session/lease.js';
 import { writeSwitchRequest } from '../state/switch-request.js';
 import { setActive } from '../state/active.js';
+import { recordHandPick } from '../state/hand-pick.js';
+import { withSwitchLock } from '../state/switch-lock.js';
 import { syncEditorPointerIfEnabled } from '../editor/junction.js';
 import { listAccounts } from '../accounts/registry.js';
 import {
@@ -141,6 +143,7 @@ function modelWindowOf(a: StateAccount, model: string | null, now: number): Wind
 
 function statusWords(a: StateAccount, here: boolean, now: number): string {
   if (!a.enabled) return 'turned off';
+  if (a.status.state === 'on-hold') return 'on hold at Anthropic (claude.ai/restricted)';
   if (!a.loggedIn || a.status.state === 'logged-out') return `signed out (ccx login ${a.name})`;
   if (a.status.state === 'blocked') {
     const what =
@@ -400,8 +403,13 @@ export async function swapCommand(
     return 0;
   }
 
-  setActive(name, context.ctx);
-  syncEditorPointerIfEnabled(context);
+  // Under the lock the auto-switch watcher switches under, as `ccx use` does.
+  withSwitchLock(context.ctx, { waitMs: 2_000 }, () => {
+    setActive(name, context.ctx);
+    syncEditorPointerIfEnabled(context);
+  });
+  // Chosen by hand, which the auto-switch watcher leaves alone while it can run.
+  recordHandPick(name, context.ctx);
   context.out(
     `New sessions start on ${name}. Running ones stay where they are (ccx use ${name} moves them too).`,
   );

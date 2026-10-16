@@ -12,6 +12,7 @@ import { probeUsage, type LimitProbeResult } from './limit-probe.js';
 import { learnWindowCost } from './runway.js';
 import { refreshCredentialIfExpired, renewalIsDue, expiredLongerThan, type RefreshOutcome } from './oauth-refresh.js';
 import { editorPointerAccount } from '../editor/junction.js';
+import { isOnHold, reportFinishedLogin } from '../accounts/login-check.js';
 
 /**
  * Cached per-account subscription usage (5h/7d utilization + resets), fetched
@@ -58,9 +59,9 @@ export type UsageSnapshot = z.infer<typeof SnapshotSchema>;
 const FILENAME = 'usage-snapshot.json';
 export const USAGE_TTL_MS = 5 * 60_000;
 /**
- * How long a login must have been expired before ccx will renew one the editor is
- * pointed at. A running Claude refreshes within minutes, so half an hour of
- * nothing means nothing is holding it.
+ * How long a login must have been expired before ccx will renew one that shares
+ * its token with the profile the editor is pointed at. A running Claude
+ * refreshes within minutes, so half an hour of nothing means nothing is holding it.
  */
 const EDITOR_IDLE_GRACE_MS = 30 * 60_000;
 
@@ -155,8 +156,11 @@ export interface RefreshUsageOptions {
    * Renew an account's token before reading its usage. An account you are not
    * using goes stale within hours, and a stale token cannot report usage, which
    * would hide exactly the accounts rotation wants to move to.
+   *
+   * `rejected`: the fingerprint of an access token the usage endpoint just
+   * turned away, for a renewal made because of that rather than its expiry.
    */
-  renew?: (accountDir: string) => Promise<RefreshOutcome>;
+  renew?: (accountDir: string, rejected?: string) => Promise<RefreshOutcome>;
 }
 
 /**
@@ -219,17 +223,29 @@ export async function renewIdleLogin(
   // expired, their usage became unreadable, and the rotation policy went
   // blind on exactly the accounts it was meant to choose between. The
   // renewal is carried across to them instead.
-  // The editor has to be protected through the WHOLE cohort, not just when
-  // it points at this account. Profiles sharing a login share its fate, so
-  // renewing a sibling rotates the token the editor is using and then
-  // carries it into the editor's own file mid-session. Before this change
-  // any sibling caused a refusal, so that could not happen; now it can, and
-  // the grace period is measured against the EDITOR's copy, which is the one
-  // that says whether anything is still using it.
+  // The profile the editor is pointed at may be renewed here. The editor's
+  // Claude renews its login under <pointer>/.oauth_refresh.lock, which is in
+  // that profile's folder, the lock this renewal takes, and reads the login
+  // again under it, sending nothing when it changed meanwhile (read from
+  // Claude Code 2.1.294 to 2.1.299). Where it reads that login from: on
+  // Linux and Windows the profile's own .credentials.json, through the
+  // pointer, so it takes up a renewal made here. On macOS a Keychain item of
+  // its own comes first, named after the pointer's path, which ccx never
+  // writes; until it has saved a login there it reads the profile's file as
+  // elsewhere. Its first save goes into that item and deletes the profile's
+  // file, and from then on it keeps that login whatever the pointer points
+  // at, so the profile no longer holds a copy a renewal here could spend
+  // under it. A profile that SHARES that login is another matter: it has a lock of
+  // its own, so renewing it spends the token the editor holds with nothing to
+  // keep the two apart, and then carries the result into the editor's folder
+  // mid-session. That is still refused while the editor may be using it, the
+  // grace period measured against the EDITOR's copy, which is the one that
+  // says whether anything still is.
   const editor = accounts.find((a) => a.name === editorAccount);
   const editorMayBeUsingIt =
     editor !== undefined &&
-    [account.name, ...siblings].includes(editor.name) &&
+    editor.name !== account.name &&
+    siblings.includes(editor.name) &&
     !expiredLongerThan(editor.dir, EDITOR_IDLE_GRACE_MS);
   // Read FRESH, at the moment of the decision, rather than from the map
   // built before the loop. This loop makes a network call per account and
@@ -256,7 +272,7 @@ export async function renewIdleLogin(
     inSessionNow.length > 0
       ? `not renewed: a session is using ${inSessionNow.join(', ')}; renewing would sign it out`
       : editorMayBeUsingIt
-        ? 'not renewed: your editor is pointed at this account and may be using it'
+        ? 'not renewed: your editor is pointed at a profile that shares this login and may be using it'
         : null;
   const mayRenew = refusal === null;
   if (refusal && renewalIsDue(account.dir)) {
@@ -274,7 +290,8 @@ export async function renewIdleLogin(
         renew(account.dir),
       )
     : { result: { status: 'not-needed' as const }, carried: [] as string[] };
-  if (renewal.status === 'refreshed') {
+  // A renewal another caller started is logged by that caller.
+  if (renewal.status === 'refreshed' && !renewal.alreadyKnown) {
     logCredentialEvent({ account: account.name, kind: 'renewed' }, c);
     for (const name of carried) {
       logCredentialEvent(
@@ -320,7 +337,9 @@ export async function refreshUsage(
   const probe =
     options.probe ?? ((file: string) => probeUsage(file));
   const renew =
-    options.renew ?? ((accountDir: string) => refreshCredentialIfExpired(accountDir, { ctx: c }));
+    options.renew ??
+    ((accountDir: string, rejected?: string) =>
+      refreshCredentialIfExpired(accountDir, { ctx: c, ...(rejected ? { renewRejected: rejected } : {}) }));
 
   const snapshot = readUsageSnapshot(c);
   const aged = accounts.filter((a) => {
@@ -365,36 +384,39 @@ export async function refreshUsage(
     try {
       const { lease } = await renewIdleLogin(account, accounts, c, {
         ...(options.leaseOptions ? { leaseOptions: options.leaseOptions } : {}),
-        renew,
+        renew: (accountDir) => renew(accountDir),
         editorAccount,
       });
       // The live session's copy is the one being kept fresh, so for a leased
       // account that is the file to read, PROVIDED the session is actually
       // signed in as this account. See usageCredentialDir.
-      result = await probe(path.join(usageCredentialDir(account, lease?.configDir), '.credentials.json'));
+      const file = path.join(usageCredentialDir(account, lease?.configDir), '.credentials.json');
+      result = await probe(file);
+      // Turned away: revoked, or signed out at claude.ai, however long its
+      // stored expiry says it has. Only the token endpoint can say whether the
+      // login is finished, so it is renewed now, for that token, through the
+      // same guards as any idle renewal: never under a session or an editor
+      // that may be using it. A session's own copy is that session's to find
+      // out about, so only the profile's is taken up here.
+      const rejected = result.rejected;
+      if (rejected && !lease) {
+        const { renewal } = await renewIdleLogin(account, accounts, c, {
+          ...(options.leaseOptions ? { leaseOptions: options.leaseOptions } : {}),
+          renew: (accountDir) => renew(accountDir, rejected.token),
+          editorAccount,
+        });
+        if (renewal.status === 'refreshed') result = await probe(file);
+        else if (renewal.status === 'needs-login' && !renewal.alreadyKnown) {
+          const detail = renewal.detail ?? rejected.message;
+          reportFinishedLogin(account.name, { detail, onHold: isOnHold(detail) }, c);
+        }
+      }
     } catch {
       result = { verdict: 'unknown' };
     }
 
-    const known = result.fiveHour !== undefined || result.sevenDay !== undefined;
-    if (known) {
-      const previous = snapshot.accounts[account.name];
-      const fresh = {
-        fiveHour: result.fiveHour ?? null,
-        sevenDay: result.sevenDay ?? null,
-        fiveHourReset: result.fiveHourReset ?? null,
-        sevenDayReset: result.sevenDayReset ?? null,
-        ...(result.models
-          ? { models: result.models.map((m) => ({ name: m.name, utilization: m.utilization, resetsAt: m.resetsAt ?? null })) }
-          : {}),
-        at: now(),
-      };
-      const learned = learnWindowCost(previous, fresh);
-      snapshot.accounts[account.name] = {
-        ...fresh,
-        ...(learned.windowCost !== null ? { windowCost: learned.windowCost } : {}),
-        ...(learned.costAnchor ? { costAnchor: learned.costAnchor } : {}),
-      };
+    if (answered(result)) {
+      snapshot.accounts[account.name] = entryFromProbe(snapshot.accounts[account.name], result, now());
     } else {
       // Could not read it (offline, or the endpoint asked us to slow down).
       // KEEP the last known numbers rather than replacing them with blanks, and
@@ -413,6 +435,61 @@ export async function refreshUsage(
     /* cache write is best effort */
   }
   return snapshot;
+}
+
+/** Whether a usage read came back with numbers, rather than turned away or lost. */
+function answered(result: LimitProbeResult): boolean {
+  return result.fiveHour !== undefined || result.sevenDay !== undefined;
+}
+
+/**
+ * The stored entry for one answered read, with what a 5-hour window costs the
+ * week learned against the entry it replaces.
+ */
+function entryFromProbe(previous: UsageEntry | undefined, result: LimitProbeResult, at: number): UsageEntry {
+  const fresh = {
+    fiveHour: result.fiveHour ?? null,
+    sevenDay: result.sevenDay ?? null,
+    fiveHourReset: result.fiveHourReset ?? null,
+    sevenDayReset: result.sevenDayReset ?? null,
+    ...(result.models
+      ? { models: result.models.map((m) => ({ name: m.name, utilization: m.utilization, resetsAt: m.resetsAt ?? null })) }
+      : {}),
+    at,
+  };
+  const learned = learnWindowCost(previous, fresh);
+  return {
+    ...fresh,
+    ...(learned.windowCost !== null ? { windowCost: learned.windowCost } : {}),
+    ...(learned.costAnchor ? { costAnchor: learned.costAnchor } : {}),
+  };
+}
+
+/**
+ * File one account's usage as read by a caller that asked the endpoint itself.
+ *
+ * The auto-switch watcher reads the account in use every minute, far inside
+ * the five minutes this cache keeps a number. Filing its reading here means
+ * the dashboard, the status line and every session show the number the
+ * watcher acted on, and find the entry fresh instead of each asking again.
+ *
+ * Only an answered read is filed. One that was turned away is dropped rather
+ * than stamped: the caller keeps its own record of what failed, and a stamp
+ * here would make an old number look newly checked.
+ */
+export function recordUsageReading(
+  name: string,
+  result: LimitProbeResult,
+  c: PathCtx = {},
+  at: number = Date.now(),
+): boolean {
+  if (!answered(result)) return false;
+  // Read at the moment of writing, not held from earlier: the snapshot has no
+  // lock, and the smaller the gap the less of another writer's work is undone.
+  const snapshot = readUsageSnapshot(c);
+  snapshot.accounts[name] = entryFromProbe(snapshot.accounts[name], result, at);
+  writeUsageSnapshot(snapshot, c);
+  return true;
 }
 
 /**

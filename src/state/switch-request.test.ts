@@ -10,6 +10,7 @@ import {
   requestMoves,
   sweepDeadSwitchRequests,
 } from './switch-request.js';
+import { takeLease } from '../session/lease.js';
 
 function ctx() {
   const home = mkdtempSync(path.join(tmpdir(), 'cas-switch-'));
@@ -97,6 +98,25 @@ describe('requestMoves', () => {
     expect(readSwitchRequest(c, 13)).toEqual({ account: 'b', at: 5, mode: 'restart' });
     expect(readSwitchRequest(c, 12)).toBeNull();
     expect(readSwitchRequest(c)).toBeNull();
+  });
+
+  it('takes back a move still waiting for a session that is already where it is now asked to be', () => {
+    // `ccx use b` asks the session on a to move; before it has, `ccx use a`
+    // says to stay. Left in place, the first request would still move it to b.
+    const c = ctx();
+    requestMoves('b', [{ pid: 11, account: 'a' }], 'seamless', c, 5);
+    requestMoves('a', [{ pid: 11, account: 'a' }], 'seamless', c, 6);
+    expect(readSwitchRequest(c, 11)).toBeNull();
+  });
+
+  it('takes it back for a running session already there that was not among those asked', () => {
+    // The dashboard asks only the sessions chosen; one left out, already on
+    // the account, still had its earlier move waiting.
+    const c = ctx();
+    takeLease('a', path.join(c.env.CLAUDE_AUTO_SWITCH_HOME, 'session'), c);
+    writeSwitchRequest('b', 5, 'seamless', c, process.pid);
+    requestMoves('a', [], 'seamless', c, 6);
+    expect(readSwitchRequest(c, process.pid)).toBeNull();
   });
 });
 

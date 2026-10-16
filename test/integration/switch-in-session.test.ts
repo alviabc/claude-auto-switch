@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   mkdtempSync,
   mkdirSync,
@@ -21,6 +21,12 @@ import { loadConfig } from '../../src/config/config.js';
 import { liveLeases, leasePath } from '../../src/session/lease.js';
 import { saveToken } from '../../src/daemon/token-store.js';
 import type { CliContext } from '../../src/context.js';
+import { dueLogin, freshUsage, renewingTokenEndpoint } from './typeable-claude.js';
+import { useCommand } from '../../src/commands/use.js';
+import { setTarget } from '../../src/daemon/junction.js';
+import { editorLinkPath, editorPointerAccount } from '../../src/editor/junction.js';
+import { listAccounts } from '../../src/accounts/registry.js';
+import { CREDENTIALS_LOCK_DIR } from '../../src/claude/locks.js';
 
 const fakeClaude = fileURLToPath(new URL('../fake-claude/fake-claude.mjs', import.meta.url));
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -182,6 +188,8 @@ function conversationOf(args: string[] | undefined): string | null {
 
 describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a running session (against fake-claude)', () => {
   afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.FAKE_CLAUDE_CHATTER_EVERY_MS;
     delete process.env.FAKE_CLAUDE_IDLE_MS;
     delete process.env.FAKE_CLAUDE_RUNS_LOG;
     delete process.env.FAKE_CLAUDE_EMIT_CAP;
@@ -598,6 +606,194 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)('on-demand switch in a runnin
     // (the simulated ~30s re-read at run's end sees B), with no restart.
     const lastReread = runs.filter((r) => r.type === 'reread').pop();
     expect(lastReread?.marker).toBe('B');
+  });
+
+  /**
+   * A switch to B, whose login is due for renewal. Claude stays busy for the
+   * whole run, so a switch that needs a restart waits and is never made: only
+   * a move in place can put the session on B.
+   */
+  async function switchToDueLogin(
+    options: {
+      bInUseElsewhere?: boolean;
+      /** The editor follows the active account (`ccx editor on`), and is on A. */
+      editorOnA?: boolean;
+      /** Asked as `ccx use B` does, rather than by a request written for this session. */
+      byCcxUse?: boolean;
+      /** Run once the switch has been asked for. */
+      afterAsking?: (home: string, context: CliContext) => Promise<void>;
+      /** How long a renewal that did not happen waits before it is tried again. */
+      retryMs?: number;
+      /** Another process holds B's login lock throughout. */
+      bLockHeld?: boolean;
+      /** Claude prints a line this often. */
+      chatterMs?: number;
+    } = {},
+  ): Promise<{
+    runs: RunEntry[];
+    home: string;
+    renewals: number;
+    context: CliContext;
+  }> {
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-switch-renew-'));
+    const runsLog = path.join(home, 'runs.jsonl');
+    Object.assign(process.env, {
+      FAKE_CLAUDE_RUNS_LOG: runsLog,
+      // Long enough for a slow runner to renew and move well before the end.
+      FAKE_CLAUDE_IDLE_MS: '8000',
+      FAKE_CLAUDE_SESSION_RECORD: '1',
+      FAKE_CLAUDE_STATUS: 'busy',
+    });
+    const context = makeContext(home);
+    await loginAccount(context, home, 'A');
+    await loginAccount(context, home, 'B');
+    dueLogin(path.join(home, 'profiles', 'B'), 'B');
+    freshUsage(home, ['A', 'B']);
+    if (options.bInUseElsewhere) {
+      // Another session, in a process that is running, announces it is on B.
+      mkdirSync(path.join(home, 'sessions-live'), { recursive: true });
+      writeFileSync(
+        path.join(home, 'sessions-live', `B__${process.ppid}.json`),
+        JSON.stringify({ account: 'B', pid: process.ppid, configDir: path.join(home, 'elsewhere'), at: Date.now() }),
+        'utf8',
+      );
+    }
+    if (options.retryMs !== undefined) context.moveRenewalRetryMs = options.retryMs;
+    if (options.bLockHeld) mkdirSync(path.join(home, 'profiles', 'B', CREDENTIALS_LOCK_DIR));
+    if (options.chatterMs) process.env.FAKE_CLAUDE_CHATTER_EVERY_MS = String(options.chatterMs);
+    const renewals = renewingTokenEndpoint();
+    setActive('A', context.ctx);
+    if (options.editorOnA) setTarget(editorLinkPath(context.ctx), path.join(home, 'profiles', 'A'));
+
+    const running = runCommand(context, []);
+    await firstLaunch(runsLog);
+    if (options.byCcxUse) expect(useCommand(context, 'B')).toBe(0);
+    else writeSwitchRequest('B', Date.now(), 'seamless', context.ctx, process.pid);
+    await options.afterAsking?.(home, context);
+    expect(await running).toBe(0);
+    return { runs: readRuns(runsLog), home, renewals: renewals(), context };
+  }
+
+  it('points the editor at once on `ccx use`, and the session still renews the login in place', async () => {
+    // `ccx use B` points the editor at B. Claude, the editor's included, renews
+    // a login under the lock ccx takes (<config dir>/.oauth_refresh.lock, in
+    // B's folder through the pointer) and reads it again there, so the session
+    // may renew B with the editor on it, and need not restart to have it renewed.
+    const { runs, renewals, context } = await switchToDueLogin({
+      editorOnA: true,
+      byCcxUse: true,
+      afterAsking: async (_home, ctx) => {
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(editorPointerAccount(listAccounts(ctx.ctx), ctx.ctx)).toBe('B');
+      },
+    });
+    expect(runs.filter((r) => r.type === 'launch')).toHaveLength(1);
+    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('B');
+    expect(renewals).toBe(1);
+    expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('B');
+  });
+
+  it('moves a session asked by name though the file naming the active account cannot be read', async () => {
+    // `ccx use --here`, `--session` and `/ccx` move one session and leave the
+    // active account and the editor alone. With the editor on, the move went
+    // on to read active.json, which threw inside the poll and ended ccx after
+    // the login had been swapped.
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-targeted-unreadable-'));
+    const runsLog = path.join(home, 'runs.jsonl');
+    process.env.FAKE_CLAUDE_IDLE_MS = '3000';
+    process.env.FAKE_CLAUDE_RUNS_LOG = runsLog;
+    const context = makeContext(home);
+    await loginAccount(context, home, 'A');
+    await loginAccount(context, home, 'B');
+    setActive('A', context.ctx);
+    setTarget(editorLinkPath(context.ctx), path.join(home, 'profiles', 'A'));
+
+    const running = runCommand(context, []);
+    await firstLaunch(runsLog);
+    writeFileSync(path.join(home, 'active.json'), '{not json', 'utf8');
+    writeSwitchRequest('B', Date.now(), 'seamless', context.ctx, process.pid);
+    expect(await running).toBe(0);
+    const runs = readRuns(runsLog);
+    expect(runs.filter((r) => r.type === 'launch')).toHaveLength(1);
+    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('B');
+  });
+
+  it("keeps Claude's terminal flowing while another process holds the login's lock", async () => {
+    // ccx relays Claude's output, and the keys typed into it, on the same
+    // thread that renews: a renewal that waited for the lock stopped both.
+    const relayedAt: number[] = [];
+    const write = process.stdout.write;
+    process.stdout.write = function (this: NodeJS.WriteStream, ...args: Parameters<typeof write>) {
+      relayedAt.push(Date.now());
+      return write.apply(this, args);
+    } as typeof write;
+    let result: Awaited<ReturnType<typeof switchToDueLogin>>;
+    try {
+      result = await switchToDueLogin({ bLockHeld: true, chatterMs: 100 });
+    } finally {
+      process.stdout.write = write;
+    }
+    const gaps = relayedAt.slice(1).map((at, i) => at - relayedAt[i]!);
+    expect(relayedAt.length).toBeGreaterThan(20);
+    expect(Math.max(...gaps)).toBeLessThan(1_500);
+    // The login stays held, so nothing was renewed and the session stayed where it was.
+    expect(result.renewals).toBe(0);
+    expect(result.runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('A');
+  });
+
+  it('`ccx use` with no session to move renews nothing, and points the editor at once', async () => {
+    // A command that ends as soon as it has printed must not leave a renewal
+    // running: interrupted mid-request, it would spend the login's token
+    // without saving the new one.
+    const home = mkdtempSync(path.join(tmpdir(), 'cas-use-no-renewal-'));
+    const context = makeContext(home);
+    await loginAccount(context, home, 'A');
+    await loginAccount(context, home, 'B');
+    dueLogin(path.join(home, 'profiles', 'B'), 'B');
+    const renewals = renewingTokenEndpoint();
+    setActive('A', context.ctx);
+    setTarget(editorLinkPath(context.ctx), path.join(home, 'profiles', 'A'));
+
+    expect(useCommand(context, 'B', {}, () => [])).toBe(0);
+    await sleep(500);
+    expect(renewals()).toBe(0);
+    // As before: the login is left to whoever uses it first.
+    expect(editorPointerAccount(listAccounts(context.ctx), context.ctx)).toBe('B');
+  });
+
+  it('tries the renewal again once the session that was using the login has gone', async () => {
+    const { runs, renewals } = await switchToDueLogin({
+      bInUseElsewhere: true,
+      // No wait at all: the refusal is still said once before it is tried again.
+      retryMs: 0,
+      afterAsking: async (home) => {
+        await waitFor(
+          'the renewal to be refused',
+          () => (existsSync(path.join(home, 'events.jsonl')) ? readFileSync(path.join(home, 'events.jsonl'), 'utf8') : ''),
+          (events) => events.includes('another session is using it'),
+        );
+        // That session ends, and gives the login up.
+        rmSync(path.join(home, 'sessions-live', `B__${process.ppid}.json`));
+      },
+    });
+    expect(renewals).toBe(1);
+    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('B');
+  });
+
+  it('renews a login that is due, then switches onto it in place rather than restarting Claude', async () => {
+    const { runs, renewals } = await switchToDueLogin();
+    expect(runs.filter((r) => r.type === 'launch')).toHaveLength(1);
+    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('B');
+    expect(renewals).toBe(1);
+  });
+
+  it('never renews a login another session is using to switch onto it', async () => {
+    // Renewing replaces the login, and the session using it would be signed
+    // out. So the switch waits for a restart, as before, and says why.
+    const { runs, home, renewals } = await switchToDueLogin({ bInUseElsewhere: true });
+    expect(renewals).toBe(0);
+    expect(runs.filter((r) => r.type === 'reread').pop()?.marker).toBe('A');
+    expect(readFileSync(path.join(home, 'events.jsonl'), 'utf8')).toContain('another session is using it');
   });
 
   it('a TARGETED seamless switch moves this session but leaves the global active account alone', async () => {
