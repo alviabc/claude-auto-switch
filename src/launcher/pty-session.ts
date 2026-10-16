@@ -105,6 +105,15 @@ export interface PtySessionOptions {
    */
   verifyCap?: (renderedText: string) => Promise<boolean>;
   /**
+   * Called when the conversation's record says a turn was refused because the
+   * login no longer works ("Please run /login"); resolves true ONLY when the
+   * login is confirmed finished (asked of the token endpoint, and written down,
+   * so the account leaves rotation). The session then ends as `needs-login`,
+   * and the swap loop carries the conversation on elsewhere. When absent, or
+   * not confirmed, nothing happens: Claude's word alone is not enough.
+   */
+  verifySignedOut?: () => Promise<boolean>;
+  /**
    * Do not watch for usage limits during this run. Used for the deliberate
    * "run anyway" case, where the limit is already known and the operator needs
    * the session to start so they can switch models.
@@ -282,6 +291,12 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
      */
     const UNPROVEN_HOLD_MS = 2 * 60_000;
     /**
+     * How long after a login check that confirmed nothing (the login works, or
+     * could not be asked about) Claude's "Please run /login" is let be. Each
+     * check is two requests at most, and Claude says it on every turn.
+     */
+    const LOGIN_RECHECK_MS = options.refuteBackoffMs ?? 60_000;
+    /**
      * How long a confirmed cap waits before it is relieved in place.
      *
      * Set longer than the exit handler's own settle (250ms) so that when Claude
@@ -309,6 +324,12 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
     let suppressUntil = 0;
     let lastHit: (Hit & { sidechain: boolean }) | null = null;
     let pendingVerify: Promise<boolean> | null = null;
+    /** What Claude showed when its login was turned away, once that was confirmed finished. */
+    let signedOut: string | null = null;
+    /** A login check in flight, and when another may be asked after one that confirmed nothing. */
+    let checkingLogin = false;
+    let pendingLoginCheck: Promise<void> | null = null;
+    let loginQuietUntil = 0;
     let finalized = false;
     // The "No conversation found to continue" error only matters on a resuming
     // launch, and the real one prints in the FIRST flush of output. Watching any
@@ -378,11 +399,42 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
       if (lastConversation !== null && lastConversation !== watched.conversation) {
         watched = { conversation: lastConversation, since: Date.now() };
       }
+      // Not a limit, so watched even when limits are not.
+      if (seen.signedOut !== null) onSignedOut(seen.signedOut);
       if (options.ignoreLimits) return;
       for (const refusal of seen.refusals) {
         const { text, hit } = hitOf(refusal);
         onLimitEvidence(hit, text, refusal.sidechain);
       }
+    };
+
+    /**
+     * A turn refused because the login no longer works. Ended, to carry on
+     * elsewhere, only once that is confirmed: Claude's word alone is not enough,
+     * since the session's copy of the login may only be behind the account's.
+     * One check at a time, and after one that confirmed nothing, none for a
+     * while, however often Claude says it again. `last`: read after the child
+     * exited, the last chance there is, so the quiet period does not apply.
+     */
+    const onSignedOut = (text: string, last = false): void => {
+      if (!options.verifySignedOut || checkingLogin || signedOut !== null || switching) return;
+      if (!last && (exited || Date.now() < loginQuietUntil)) return;
+      checkingLogin = true;
+      pendingLoginCheck = options
+        .verifySignedOut()
+        .catch(() => false)
+        .then((finished) => {
+          checkingLogin = false;
+          // A switch owns the session's outcome, and this check does not take
+          // it over. A child that exited meanwhile still counts: the exit waits
+          // for this answer (see finalize), as it does for a limit check.
+          if (finished && !switching) {
+            signedOut = text;
+            if (!exited) setTimeout(safeKill, 150);
+          } else if (!finished) {
+            loginQuietUntil = Date.now() + LOGIN_RECHECK_MS;
+          }
+        });
     };
 
     /** Whether a prompt can be typed into this child at all (see CapContext.canType). */
@@ -875,6 +927,21 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
 
       const finalize = (): void => {
         if (finalized) return;
+        // A login check still in flight decides this exit as much as a limit
+        // check does: Claude can exit, or be closed, after "Please run /login"
+        // and before the answer comes back. Waited for once, and not for ever.
+        const loginCheck = pendingLoginCheck;
+        if (loginCheck && checkingLogin) {
+          pendingLoginCheck = null;
+          void new Promise<void>((settled) => {
+            const giveUp = setTimeout(settled, 12_000);
+            void loginCheck.finally(() => {
+              clearTimeout(giveUp);
+              settled();
+            });
+          }).then(finalize);
+          return;
+        }
         finalized = true;
         dataSub.dispose();
         // Nothing is killed here. The child has already exited; calling kill()
@@ -903,9 +970,11 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
                   ranMs,
                   ...(cap.isConfirmed() ? {} : { unproven: true as const }),
                 }
-              : noConversation
-                ? { kind: 'no-conversation', exitCode, ranMs }
-                : { kind: 'ok', exitCode, ranMs, ...(handover ? { handover: true as const } : {}) },
+              : signedOut !== null
+                ? { kind: 'needs-login', exitCode, reason: signedOut, ranMs, midSession: true as const }
+                : noConversation
+                  ? { kind: 'no-conversation', exitCode, ranMs }
+                  : { kind: 'ok', exitCode, ranMs, ...(handover ? { handover: true as const } : {}) },
         );
       };
 
@@ -971,10 +1040,15 @@ export function runPtySession(options: PtySessionOptions): Promise<SessionOutcom
         const verifyHeldThenFinalize = (): void => {
           // One last read of the record, for a refusal written just before the
           // exit; the screen only counts while the record could not be read.
-          const final = options.ignoreLimits ? null : record.poll(lastConversation);
-          if (final?.readable) recordReadable = true;
+          const final = record.poll(lastConversation);
+          if (final.readable && !options.ignoreLimits) recordReadable = true;
+          // A "Please run /login" written just before the exit is asked about
+          // too; finalize waits for the answer.
+          if (final.signedOut !== null) onSignedOut(final.signedOut, true);
           // The main thread's only, as above.
-          const lastRefusal = final?.refusals.filter((refusal) => !refusal.sidechain).pop();
+          const lastRefusal = options.ignoreLimits
+            ? undefined
+            : final.refusals.filter((refusal) => !refusal.sidechain).pop();
           const recorded = lastRefusal ? hitOf(lastRefusal) : null;
           const live = recordReadable ? null : matchesCapText(window);
           const pending = unprobed ?? recorded ?? (live ? { text: window, hit: live } : null);
