@@ -1,5 +1,5 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { addCommand } from '../../src/commands/add.js';
@@ -12,6 +12,7 @@ import { loadConfig } from '../../src/config/config.js';
 import { liveLeases } from '../../src/session/lease.js';
 import { saveToken } from '../../src/daemon/token-store.js';
 import { IN_PLACE_PROMPT } from '../../src/session/resume-prompt.js';
+import { CREDENTIALS_LOCK_DIR } from '../../src/claude/locks.js';
 import type { CliContext } from '../../src/context.js';
 import {
   FAKE_ENV,
@@ -19,10 +20,13 @@ import {
   PTY_AVAILABLE,
   QUICK,
   TYPEABLE,
+  dueLogin,
   fakeClaude,
+  freshUsage,
   launches,
   prompts,
   readLog,
+  renewingTokenEndpoint,
   waitFor,
 } from './typeable-claude.js';
 
@@ -39,6 +43,7 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
   () => {
     const started: number[] = [];
     afterEach(() => {
+      vi.unstubAllGlobals();
       for (const name of FAKE_ENV) delete process.env[name];
       for (const pid of started.splice(0)) {
         try {
@@ -88,6 +93,20 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
           caps: Array<{ account: string }>;
         }
       ).caps.map((c) => c.account);
+    /** Accounts recorded as out of room for the next hour, as another session or an older reading left them. */
+    const recordedOut = (home: string, names: string[]): void =>
+      writeFileSync(
+        path.join(home, 'ledger.json'),
+        JSON.stringify({
+          caps: names.map((account) => ({
+            account,
+            capUntil: Date.now() + 3_600_000,
+            reason: 'usage cap',
+            at: Date.now(),
+          })),
+        }),
+        'utf8',
+      );
 
     async function twoAccounts(
       prefix: string,
@@ -420,6 +439,283 @@ describe.skipIf(!PTY_AVAILABLE && !process.env.CI)(
         ]);
         expect(prompts(log)).toEqual([]);
         expect(eventsIn(home).filter((e) => e.kind === 'cap-relief')).toEqual([]);
+      },
+    );
+
+    it(
+      'moves in place when every account looks out of room, and says that is a guess',
+      { timeout: 60_000 },
+      async () => {
+        // B is recorded as out of room, wrongly: it has room. The relaunch
+        // path makes this same guess, and ended what Claude had running to
+        // act on it. The guess is made under the running Claude instead.
+        const { home, runsLog, context } = await twoAccounts('cas-in-place-anyway-');
+        recordedOut(home, ['B']);
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '20000',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1500',
+          FAKE_CLAUDE_EXIT_AFTER_PROMPTS: '1',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        const log = readLog(runsLog);
+        expect(launches(log)).toHaveLength(1);
+        expect(prompts(log)).toEqual([
+          expect.objectContaining({ text: IN_PLACE_PROMPT, marker: 'B', refused: false }),
+        ]);
+        const events = eventsIn(home);
+        expect(events.filter((e) => e.kind === 'cap-relief')).toHaveLength(1);
+        expect(events.map((e) => e.msg)).toContainEqual(
+          expect.stringMatching(/every account looks out of room.*Moving this session to "B" in place anyway/),
+        );
+        expect(capsIn(home)).toContain('A');
+      },
+    );
+
+    it(
+      'starts when the file naming the active account cannot be read',
+      { timeout: 60_000 },
+      async () => {
+        // Account choice treats it as naming no account, rather than failing.
+        const { home, runsLog, context } = await twoAccounts('cas-active-unreadable-');
+        writeFileSync(path.join(home, 'active.json'), '{not json', 'utf8');
+        Object.assign(process.env, { ...TYPEABLE, FAKE_CLAUDE_RUNS_LOG: runsLog, FAKE_CLAUDE_IDLE_MS: '600' });
+
+        expect(await runCommand(context, [])).toBe(0);
+        expect(launches(readLog(runsLog))).toHaveLength(1);
+      },
+    );
+
+    it(
+      'still guesses in place when the file naming the active account cannot be read',
+      { timeout: 60_000 },
+      async () => {
+        const { home, runsLog, context } = await twoAccounts('cas-in-place-anyway-unreadable-');
+        recordedOut(home, ['B']);
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '20000',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '4000',
+          FAKE_CLAUDE_EXIT_AFTER_PROMPTS: '1',
+        });
+
+        const running = runCommand(context, []);
+        await waitFor('the launch', () => launches(readLog(runsLog)), (l) => l.length === 1);
+        // After the start, which writes the file, and well before the limit.
+        writeFileSync(path.join(home, 'active.json'), '{not json', 'utf8');
+
+        expect(await running).toBe(0);
+        const log = readLog(runsLog);
+        expect(launches(log)).toHaveLength(1);
+        expect(prompts(log)).toEqual([
+          expect.objectContaining({ text: IN_PLACE_PROMPT, marker: 'B', refused: false }),
+        ]);
+      },
+    );
+
+    it(
+      'never guesses its way back onto an account it has seen run out',
+      { timeout: 60_000 },
+      async () => {
+        // Every account really is out. A runs out, the guess moves the
+        // session to B, and B refuses as well. Moving back to A, which this
+        // session has just seen run out, would only bounce between the two,
+        // so the relaunch path takes over, as it did before.
+        const { home, runsLog, context } = await twoAccounts('cas-in-place-anyway-once-');
+        recordedOut(home, ['B']);
+        context.verifyCap = () => Promise.resolve<Verdict>('limited');
+        context.config.resume.auto = false;
+        context.refuteBackoffMs = 300;
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_REFUSE_ON: 'A,B',
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '20000',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1000',
+        });
+
+        const running = runCommand(context, []);
+        await waitFor(
+          'the move to B',
+          () => (existsSync(path.join(home, 'events.jsonl')) ? eventsIn(home) : []),
+          (events) => events.some((e) => e.kind === 'cap-relief'),
+        );
+        // Past the pause after a move in which a refusal is not checked, which
+        // began before the move was written down.
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        // Somebody asks again, now on B, and B refuses too.
+        process.stdin.emit('data', Buffer.from('carry on\r'));
+
+        expect(await running).toBe(0);
+        expect(eventsIn(home).filter((e) => e.kind === 'cap-relief')).toHaveLength(1);
+        expect(launches(readLog(runsLog)).map((l) => l.marker)).toEqual(['A', 'B']);
+      },
+    );
+
+    it(
+      'does not guess in place while an account has room, even one only a relaunch can reach',
+      { timeout: 60_000 },
+      async () => {
+        // B has room but only a long-lived token; C is recorded as out. Not
+        // every account looks out of room, so the session goes to B by a
+        // relaunch, as before, rather than to C by a guess.
+        const home = mkdtempSync(path.join(tmpdir(), 'cas-in-place-no-guess-'));
+        const runsLog = path.join(home, 'runs.jsonl');
+        const context = makeContext(home);
+        await loginAccount(context, home, 'A');
+        const dirB = path.join(home, 'profiles', 'B');
+        await addCommand(context, 'B', { dir: dirB, login: false });
+        mkdirSync(dirB, { recursive: true });
+        saveToken(dirB, 'sk-ant-oat01-not-a-real-token');
+        await loginAccount(context, home, 'C');
+        recordedOut(home, ['C']);
+        setActive('A', context.ctx);
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '20000',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1500',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        expect(launches(readLog(runsLog)).map((l) => [l.marker, l.oauthToken ?? null])).toEqual([
+          ['A', null],
+          [null, 'sk-ant-oat01-not-a-real-token'],
+        ]);
+        expect(eventsIn(home).filter((e) => e.kind === 'cap-relief')).toEqual([]);
+      },
+    );
+
+    it(
+      'renews the login of the account it moves to first, then moves in place',
+      { timeout: 60_000 },
+      async () => {
+        // B's login is due for renewal. A relaunch renewed it on the way and
+        // ended what Claude had running; renewed first, it goes under the
+        // running Claude instead.
+        const { home, runsLog, context } = await twoAccounts('cas-in-place-renew-');
+        dueLogin(path.join(home, 'profiles', 'B'), 'B');
+        freshUsage(home, ['A', 'B']);
+        const renewals = renewingTokenEndpoint();
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '20000',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1500',
+          FAKE_CLAUDE_EXIT_AFTER_PROMPTS: '1',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        const log = readLog(runsLog);
+        expect(launches(log)).toHaveLength(1);
+        expect(prompts(log)).toEqual([
+          expect.objectContaining({ text: IN_PLACE_PROMPT, marker: 'B', refused: false }),
+        ]);
+        expect(renewals()).toBe(1);
+        expect(eventsIn(home).filter((e) => e.kind === 'cap-relief')).toHaveLength(1);
+      },
+    );
+
+    it(
+      'waits briefly for a login another process is renewing, rather than relaunch',
+      { timeout: 60_000 },
+      async () => {
+        // A runs out while another process holds B's lock, as a second session
+        // on A renewing B does, and lets it go within a second.
+        const { home, runsLog, context } = await twoAccounts('cas-limit-lock-busy-');
+        const dirB = path.join(home, 'profiles', 'B');
+        dueLogin(dirB, 'B');
+        freshUsage(home, ['A', 'B']);
+        const lock = path.join(dirB, CREDENTIALS_LOCK_DIR);
+        mkdirSync(lock);
+        const renewals = renewingTokenEndpoint();
+        context.config.resume.auto = false;
+        context.verifyCap = () => {
+          setTimeout(() => rmSync(lock, { recursive: true, force: true }), 600);
+          return Promise.resolve<Verdict>('limited');
+        };
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '6000',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1500',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        const log = readLog(runsLog);
+        expect(launches(log)).toHaveLength(1);
+        expect(log.filter((e) => e.type === 'reread').pop()?.marker).toBe('B');
+        expect(renewals()).toBe(1);
+      },
+    );
+
+    it(
+      'records a limit met while a switch waits on a renewal against the account that met it',
+      { timeout: 60_000 },
+      async () => {
+        // A switch to B waits on B's renewal, and A runs out meanwhile. The
+        // switch must not move the session before the limit is acted on, or the
+        // limit is put down to B, the account it was moved to.
+        const { home, runsLog, context } = await twoAccounts('cas-limit-during-switch-');
+        dueLogin(path.join(home, 'profiles', 'B'), 'B');
+        freshUsage(home, ['A', 'B']);
+        renewingTokenEndpoint({ delayMs: 3_000 });
+        context.config.resume.auto = false;
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '9000',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '1500',
+        });
+
+        const running = runCommand(context, []);
+        await waitFor('the launch', () => launches(readLog(runsLog)), (l) => l.length === 1);
+        writeSwitchRequest('B', Date.now(), 'seamless', context.ctx, process.pid);
+
+        expect(await running).toBe(0);
+        expect(capsIn(home)).toEqual(['A']);
+        const log = readLog(runsLog);
+        expect(launches(log)).toHaveLength(1);
+        expect(log.filter((e) => e.type === 'reread').pop()?.marker).toBe('B');
+        // The limit moved it; the switch, waiting meanwhile, then found it there.
+        const said = eventsIn(home).map((e) => e.msg);
+        expect(said).toContainEqual(expect.stringContaining('"A" hit its limit; moved this session to "B" in place'));
+        expect(said).not.toContainEqual(expect.stringContaining('switching to "B"'));
+      },
+    );
+
+    it(
+      'acts on a limit Claude exits on, though the check also renews the next login',
+      { timeout: 60_000 },
+      async () => {
+        // Claude exits on the limit, and ccx waits at most 12 s for the check.
+        // A slow check, 8 s here, plus a renewal of up to 5 s overran that, and
+        // the limit was dropped: the session ended instead of moving on.
+        const { home, runsLog, context } = await twoAccounts('cas-limit-exit-renewal-');
+        dueLogin(path.join(home, 'profiles', 'B'), 'B');
+        freshUsage(home, ['A', 'B']);
+        renewingTokenEndpoint({ delayMs: 6_000 });
+        context.verifyCap = () => new Promise<Verdict>((resolve) => setTimeout(() => resolve('limited'), 8_000));
+        Object.assign(process.env, {
+          ...TYPEABLE,
+          FAKE_CLAUDE_RUNS_LOG: runsLog,
+          FAKE_CLAUDE_IDLE_MS: '1500',
+          FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+          FAKE_CLAUDE_REFUSE_AFTER_MS: '800',
+        });
+
+        expect(await runCommand(context, [])).toBe(0);
+        expect(launches(readLog(runsLog)).map((l) => l.marker)).toEqual(['A', 'B']);
+        expect(capsIn(home)).toContain('A');
       },
     );
 

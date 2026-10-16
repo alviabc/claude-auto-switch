@@ -51,6 +51,7 @@ import { loginCommand } from './login.js';
 import { getClaude, type CliContext } from '../context.js';
 import { claimRawTerminal } from '../ui/raw-terminal.js';
 import { signedInAndNotRejected } from '../health/signed-in.js';
+import { loginOnHold } from '../accounts/login-check.js';
 import { describeNextUp, describeWhenOut, type NextUpInput, type WhenOut } from '../dashboard/next-up.js';
 import { inDisplayOrder, keepSelection } from '../dashboard/arrange.js';
 import type { CapacityWindows } from '../usage/usable-capacity.js';
@@ -144,6 +145,28 @@ export function screenSequences(platform: NodeJS.Platform): {
 }
 const { enter: ENTER_SCREEN, epilogue: SCREEN_EPILOGUE } = screenSequences(process.platform);
 
+/**
+ * What to write to paint a frame over the previous one: home, each line
+ * clearing its own tail, then everything below. No full-screen erase, which is
+ * what keeps it from blinking.
+ *
+ * It ends with the cursor on the line under the frame, so a frame with as many
+ * lines as the screen has rows scrolls the screen on every repaint. On Windows
+ * the dashboard is on the main screen (see `screenSequences`) and each
+ * scrolled line lands in the scrollback, so the top of the dashboard piled up
+ * there every few seconds. The renderer keeps its frames short enough; this
+ * holds the line for any frame that is not, keeping its top, down to drawing
+ * nothing at all on a one-row window, where even one line break would scroll.
+ * `rows` unknown (undefined, or the 0 a terminal that cannot say reports, as
+ * the renderer also reads it) draws the whole frame.
+ */
+export function repaint(frame: string, rows: number | undefined): string {
+  const lines = frame.split('\n');
+  const shown = rows ? lines.slice(0, rows - 1) : lines;
+  const drawn = shown.map((l) => l + CLEAR_LINE_END).join('\r\n');
+  return HOME + drawn + (shown.length > 0 ? '\r\n' : '') + CLEAR_BELOW;
+}
+
 /** Live account dashboard. `--once` prints a single frame (script/CI friendly). */
 export async function dashboardCommand(
   context: CliContext,
@@ -218,6 +241,7 @@ export async function dashboardCommand(
     refreshConfig();
     const accts = listAccounts(context.ctx);
     const loggedIn = signedInAndNotRejected(healths, accts, context.ctx);
+    const onHold = new Set(accts.filter((a) => !loggedIn.has(a.name) && loginOnHold(a.dir, context.ctx)).map((a) => a.name));
     const liveEmail = new Map(healths.filter((h) => h.email).map((h) => [h.name, h.email!]));
     const livePlan = new Map(healths.filter((h) => h.plan).map((h) => [h.name, h.plan!]));
     const now = Date.now();
@@ -249,6 +273,7 @@ export async function dashboardCommand(
         priority: a.priority,
       })),
       loggedIn,
+      onHold,
       liveEmail,
       livePlan,
       cappedUntil,
@@ -1106,16 +1131,16 @@ async function runLiveLoop(build: () => ReturnType<typeof toSnapshot>, deps: Loo
       }
       rebuild();
       clamp();
-      // Paint over the previous frame from the top: home, then each line clears
-      // its own tail, then clear anything left below. No full-screen erase.
+      // Read every frame, not once at start: a window resized mid-session is
+      // exactly when a fixed-width table starts wrapping, and a frame that was
+      // short enough stops fitting.
+      const rows = process.stdout.rows;
       const frame = renderDashboard(snap, {
         color: deps.color,
         interactive: true,
         selected,
-        // Read every frame, not once at start: a window resized mid-session is
-        // exactly when a fixed-width table starts wrapping.
         ...(process.stdout.columns ? { width: process.stdout.columns } : {}),
-        ...(process.stdout.rows ? { height: process.stdout.rows } : {}),
+        ...(rows ? { height: rows } : {}),
         ...(ui.panel ? { panel: deps.panel(ui.panel.selected) } : {}),
         ...(ui.confirm ? { confirm: ui.confirm.question } : {}),
         ...(ui.notice ? { notice: ui.notice } : {}),
@@ -1129,8 +1154,7 @@ async function runLiveLoop(build: () => ReturnType<typeof toSnapshot>, deps: Loo
             }
           : {}),
       });
-      const painted = frame.split('\n').map((l) => l + CLEAR_LINE_END).join('\r\n');
-      out.write(HOME + painted + '\r\n' + CLEAR_BELOW);
+      out.write(repaint(frame, rows));
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, deps.refreshMs);
         // Waking early (a keypress / quit) clears the pending refresh timer, so

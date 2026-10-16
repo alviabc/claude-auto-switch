@@ -27,6 +27,12 @@ export interface SessionOutcome {
    * no claim about which model is spent, so callers must not record one.
    */
   unproven?: true;
+  /**
+   * For kind 'needs-login': the login was found finished while the session was
+   * running, rather than before it started. The conversation it was in is
+   * carried on to the next account.
+   */
+  midSession?: true;
   /** For kind 'switch': the account the operator asked to switch to, in place. */
   switchTo?: string;
   /**
@@ -104,6 +110,13 @@ export interface HotSwapDeps {
    */
   knownCappedAccounts?: () => string[];
   /**
+   * Handed, once, a way to ask which accounts the loop sets aside right now:
+   * those that ran out in this run, were found signed out, or are held off for
+   * a while. Asked at the moment of a decision, so a hold that has lifted no
+   * longer counts.
+   */
+  setAsideNow?: (read: () => Set<string>) => void;
+  /**
    * The last word, said when there is nothing left to run on and ccx is about
    * to exit.
    *
@@ -169,6 +182,7 @@ export async function runHotSwapSession(deps: HotSwapDeps): Promise<number> {
    * there was no second attempt and the run ended by refusing to start at all.
    */
   const lastResortsTried = new Set<string>();
+  deps.setAsideNow?.(() => new Set([...capped, ...needsLogin, ...activeHolds(Date.now())]));
 
   for (;;) {
     const account: HotSwapAccount | null =
@@ -220,8 +234,16 @@ export async function runHotSwapSession(deps: HotSwapDeps): Promise<number> {
       // token and produce "Login expired" with nothing to act on. Try the next
       // account instead. `first` is deliberately not advanced: nothing ran, so
       // the next attempt is still the first real session and must not resume.
-      needsLogin.add(account.name);
-      deps.notify(`"${account.name}" needs signing in again; trying another account...`);
+      // Unless it did run, and its login was found finished mid-session: then
+      // its conversation is carried on to the next account like any move.
+      const signedOutAs = outcome.midSession ? deps.currentAccount?.() || account.name : account.name;
+      needsLogin.add(signedOutAs);
+      if (outcome.midSession) {
+        first = false;
+        deps.notify(`"${signedOutAs}" was signed out; moving this conversation to another account...`);
+      } else {
+        deps.notify(`"${account.name}" needs signing in again; trying another account...`);
+      }
       continue;
     }
     first = false;

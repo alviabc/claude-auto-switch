@@ -79,6 +79,194 @@ semantic versioning.
   changes. Every session sets it at start to the account it is on, which is
   nearly always the one already there, and the file's time now says when the
   active account last changed.
+## [2.6.6]
+
+### Fixed
+
+- **An account signed out at Anthropic leaves rotation, wherever ccx finds
+  out.** Until now ccx only knew a login was finished when renewing it
+  failed, and it renews a login only once the stored expiry says so. A login
+  revoked before then (signed out at claude.ai, or the account put on hold)
+  still looked signed in: rotation kept choosing it, the dashboard kept it in
+  rotation, and a session started on it met "Please run /login". Now ccx asks
+  Anthropic instead of trusting the stored expiry:
+  - The usage read the dashboard, `ccx usage` and every session already make
+    for each account notices a token Anthropic turns away, and the login is
+    renewed at once. If Anthropic refuses that, the login is written down as
+    finished, the account leaves rotation, and the dashboard's recent lines say
+    so. A login a session or your editor may be using is never renewed this
+    way, as before.
+  - A session start asks about the account's token first, so a session never
+    starts on a revoked login; it starts on the next account instead.
+  - When Claude says "Please run /login" in a running session, ccx asks
+    Anthropic whether the login is really finished. If it is, the account
+    leaves rotation and the session moves to the next account and carries on
+    with its conversation, as it does when an account runs out of room. If the
+    login still works, nothing moves. Workers do the same.
+- **An account Anthropic put on hold says so.** Its login is refused with
+  "account_on_hold" and a link to claude.ai/restricted. The dashboard shows it
+  as "on hold" rather than "signed out", since signing in again does not bring
+  it back, and keeps it out of rotation.
+
+## [2.6.5]
+
+### Fixed
+
+- **The dashboard no longer fills the scrollback with copies of its top lines
+  on Windows.** When the dashboard had more lines than the window had rows, for
+  example after a sign-in added a notice and a recent line, every refresh
+  scrolled the window, and on Windows, where the dashboard draws on the main
+  screen, each scrolled line stayed behind: the title and the rule under it
+  piled up above the dashboard every few seconds. The dashboard now always
+  leaves the bottom row free. On a short window the lines under the table give
+  way first (recent activity, oldest first, then the account detail, the
+  Desktop lines, the settings line, "when one runs out", and last the line
+  about sessions on removed accounts), and then the accounts scroll to keep the highlighted one in view, as the settings panel
+  already did. The title, the notice and the keys stay.
+
+## [2.6.4]
+
+### Changed
+
+- **The message after an in-place account move no longer mentions the move.**
+  It now reads: "The usage limit no longer applies. Continue where you stopped
+  and retry anything it cut off. If nothing was cut off, say so in one line and
+  wait." The session only needs to know the limit is over, since the error it
+  can still see names a reset time, and what to retry. With no restart implied,
+  it has no reason to start again agents that are still running. A prompt you
+  set yourself is still typed as written.
+
+## [2.6.3]
+
+### Changed
+
+- **A shorter message after an in-place account move.** The prompt typed into a
+  session moved to another account without a restart no longer names ccx, and
+  says the same in fewer words: "This session switched accounts after a usage
+  limit. Nothing was restarted, so running agents and tasks are still going.
+  Continue where you stopped and retry anything the limit cut off. If nothing
+  was cut off, say so in one line and wait." A prompt you set yourself is still
+  typed as written.
+
+## [2.6.2]
+
+### Changed
+
+- **A session is no longer restarted when every account looks out of room.**
+  When an account ran out and every other one was recorded as out too, ccx
+  ended Claude and started it again on an account anyway, because that
+  record is cached and can be wrong: usage credits, a limit recorded against
+  the wrong account, a window that has since reset. Ending Claude ends every
+  subagent, background command and scheduled loop it has running. ccx now
+  makes the same guess by the same rule (the active account, else the first
+  in the account list), but moves the session onto it under the running
+  Claude, types the carry-on prompt, and says in `ccx history` that every
+  account looked out of room. The guess is never the account that just ran
+  out, nor any other account the session has itself seen run out while that
+  limit lasts, so two accounts that are both out cannot pass a session back
+  and forth. When that leaves nothing to try, the session is relaunched as
+  before.
+- **A switch, or a move after a limit, no longer restarts Claude to renew the
+  next account's login.** A login that was due for renewal could not go under
+  a running Claude, so a switch onto that account (`ccx use`, `/ccx`, an
+  early move), or a move to it after a limit, restarted Claude and let the
+  start renew it. The session now renews it first and then moves in place, as
+  a visit for an Artifact call already did. It still never renews a login
+  another session or your editor may be using, because renewing replaces the
+  login and signs them out; then the switch waits for a restart as before, and
+  `ccx history` says why. The restart's start still renews it without that
+  check, as it always has (#128). A renewal that could not be made, because
+  another session was using the login or the renewal failed, is tried again
+  after 20 seconds while the switch waits; one that found the login being
+  renewed elsewhere at that moment, after 2 seconds. A login whose lock folder
+  cannot be created (a profile folder ccx may not write in) is not renewed
+  from a session, and a switch onto it restarts as before, saying so. The
+  editor (`ccx editor on`) is pointed at the new account as before, and its
+  login may now be renewed by a session moving onto it: Claude, the editor's
+  included, renews a login under the same lock ccx takes, in that profile's
+  folder, reads it again under the lock, and sends nothing when it has
+  changed (read from Claude Code 2.1.294 to 2.1.299). The editor's Claude
+  reads that profile's login file through the pointer, except on macOS once
+  it has saved a login of its own in the Keychain, after which it no longer
+  follows the pointer (#129). Because it takes and lets go of that lock
+  through the pointer, the pointer is not moved while the lock in the
+  account it is on is in use: it waits up to ten seconds, then moves it
+  anyway. A running session goes on meanwhile, but `ccx use`, swap, rotate,
+  run and auto stay open until the pointer has moved. A profile that shares its login with the one the editor is on
+  has a lock of its own, so it is still not renewed while the editor may be
+  using it. No command that
+  ends when it has printed renews anything. After a limit, ccx waits at most
+  five seconds for the renewal, and less when the check that found the limit
+  was slow, trying again every 0.2 seconds while something else is renewing
+  that login; a slower renewal finishes by itself, and the session moves
+  where it can without it.
+- **A login is never renewed twice at once.** A refresh token works once, so
+  a second renewal of the same login is refused, and reads as a login that
+  needs signing in again. Within one process, a renewal of a login already
+  being renewed, from the same profile or another holding the same login,
+  now gets that renewal's result. Between processes, ccx took Claude's lock
+  but read the token before taking it, and went ahead without the lock after
+  two seconds; it now reads the login again once it holds the lock, and
+  sends nothing when it cannot get it. A running session only tries the lock
+  and never waits for it, since waiting would stop Claude's output and keys.
+  A token request that gets no answer is given up after 30 seconds rather
+  than holding the lock. Found while adding the renewals above; not seen
+  happen.
+
+### Fixed
+
+- **A session no longer fails when the file naming the active account cannot
+  be read.** Choosing an account read `active.json` and stopped with an
+  error when it was malformed, which ended a session at its start, or when
+  its account ran out. That file only says which account to prefer, so the
+  choice now goes on as if it named none.
+- **A session told to stay put no longer moves anyway.** `ccx use B` asks a
+  session to move; `ccx use A` before it has moved said nothing to a session
+  already on A, so the first request still moved it to B. It is now taken
+  back, by `ccx use` with one session, with `--all`, or with several and
+  none moved, and by the dashboard for every session on that account,
+  chosen or not.
+
+## [2.6.1]
+
+### Fixed
+
+- **`claude` went through ccx in one shell only.** `ccx on` put the `claude`
+  function into a single file: on Windows the console profile of whichever
+  PowerShell answered first, elsewhere `.zshrc` or `.bashrc` by your login
+  shell. Every other shell ran Claude directly, with no switching, so ccx
+  worked in one window and not in the next one opened in the same folder:
+  in Cursor's terminal and not in a Windows PowerShell window, or in zsh and
+  not in bash. Running `ccx on` from the other shell changed nothing, and
+  `ccx doctor` checked only that one file. Now `ccx on` covers every shell in
+  use:
+  - Windows PowerShell always, PowerShell 7 when installed, each in its
+    `profile.ps1`, which every host reads (Windows Terminal, a standalone
+    window, an editor's terminal, the PowerShell extension's terminal, the
+    ISE). The copy an older ccx put in the console-only profile is removed,
+    because that profile is read later and its copy would run instead.
+  - Git Bash, when it is installed and has been used.
+  - zsh in `.zshrc` (under `ZDOTDIR` when it is set), and bash in `.bashrc`
+    and in the login file bash reads instead (`.bash_profile`, `.bash_login`
+    or `.profile`) unless that file loads `.bashrc`, so a login shell, which
+    is what a Mac terminal starts, gets it once.
+
+  zsh, bash and Git Bash count as in use when the shell is the login shell,
+  has a startup file or a history file, or already has the function; the
+  others are left alone, and `ccx on --shell <name>` sets one up anyway.
+  `ccx off` removes the function from every file ccx could have written.
+  **After updating, run `ccx on` once** to add the shells an older ccx left
+  out; nothing does that on its own. Unless ccx has shown its `ccx on` tip
+  before, the first session to end with a shell still missing says so, once.
+- **`ccx doctor` lists each shell** and whether typing `claude` goes through
+  ccx there, a shell that has it in only some of its files, or a second copy
+  it would also load. Where a Windows execution policy (`Restricted` or
+  `AllSigned`) stops PowerShell running its profile and npm's `ccx` command,
+  it says so and gives the command that allows local scripts for you alone,
+  without running it, or, when Group Policy sets the policy, that only an
+  administrator can change it. Under that policy `ccx on` writes no profile,
+  which would put an error in every window. cmd has no profile, and doctor says it
+  is not covered.
 
 ## [2.6.0]
 
