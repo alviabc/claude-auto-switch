@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.7]
+
+### Fixed
+
+- **On Windows, ccx repairs an npm install of Claude Code that has lost its
+  program, and starts Claude.** Claude Code's npm package ships
+  `bin\claude.exe` as a short placeholder script, and its setup step puts the
+  real program over it from a second package, `@anthropic-ai/claude-code-win32-x64`
+  (or `-arm64`). When the install loses its program, it is left with only the
+  placeholder, with no program, or with no package folder at all, while npm's
+  `claude` and `claude.cmd` stay behind. The suspected cause, not yet confirmed (#138), is an update that ran
+  while Claude was open and stopped part way, since Windows can refuse to
+  delete or overwrite the file of a program that is running. ccx then said it had found `claude.cmd` and
+  could not launch it, and gave no fix. Now:
+  - ccx never picks the placeholder. It tells it apart by its first bytes,
+    since every Windows program starts with "MZ" and the placeholder does not.
+  - When the second package still holds the real program, ccx puts it back in
+    place the way the package's own setup does, with a hardlink or else a
+    copy, and needs no network. It replaces only the placeholder or an empty
+    spot, never a real program, and leaves a file another process has open
+    alone. If that fails, ccx starts Claude from the second package directly.
+  - Otherwise ccx reinstalls the same version with the npm that belongs to the
+    folder, saying so before and after, with npm's own output in between. When
+    the package folder is gone, the version comes from the copy npm moved aside
+    and left behind, if there is one, and is otherwise the current release.
+    ccx starts npm as `node.exe` running npm's own script, since Node refuses
+    to start `npm.cmd` without a shell.
+  - A launch repairs only the install it is about to start, and only when
+    Claude cannot otherwise start from it; at most once per run, and never
+    while another ccx is repairing, which it waits for instead. `ccx doctor
+    --fix` repairs every broken install it finds.
+  - An install that changed in the last few minutes is left alone, since npm
+    may still be writing it, and nothing is taken from it.
+  - A repair that did not work is written down, and ccx does not run npm for
+    that install again until the install changes. `ccx doctor` says so, and
+    `ccx doctor --fix` tries again.
+  - `ccx worker` never repairs, since a repair can take minutes and a worker
+    has to stop when its `--timeout` says; it stops at once with the message.
+  - An older Claude Code that runs `cli.js` (2.1.110 and older) is never taken
+    for a broken install, and is started as node running its `cli.js`, where
+    ccx used to start node itself.
+  - When the repair cannot help, the message names the install folder, says it
+    is missing its program and what most likely caused that, and gives the
+    fix: close every Claude window, then run
+    `npm i -g @anthropic-ai/claude-code`, install the native build, or run
+    `ccx doctor --fix`.
+  - `ccx doctor` reports such an install, and `ccx doctor --fix` repairs it.
+
 ## [2.6.6]
 
 ### Fixed
