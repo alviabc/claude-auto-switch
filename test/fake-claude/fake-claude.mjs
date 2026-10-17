@@ -645,6 +645,18 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
       const t = setTimeout(refuse, again);
       if (t.unref) t.unref();
     }
+    // Refused once a file the test names appears, rather than at a set time:
+    // after something the test waits for has happened, however slow the
+    // machine is to get there.
+    const refuseWhen = process.env.FAKE_CLAUDE_REFUSE_WHEN;
+    if (refuseWhen) {
+      const t = setInterval(() => {
+        if (!existsSync(refuseWhen)) return;
+        clearInterval(t);
+        refuse();
+      }, 50);
+      if (t.unref) t.unref();
+    }
 
     // A subagent's turn refused, in the record Claude 2.1.296 keeps for each
     // subagent beside the conversation's own (measured). Only on an account
@@ -827,10 +839,15 @@ const capEvery = Number(process.env.FAKE_CLAUDE_CAP_EVERY_MS) || 0;
 // Started late when asked, so a test can have ccx reading the conversation's
 // own record before any of it reaches the screen.
 const capFrom = Date.now() + (Number(process.env.FAKE_CLAUDE_CAP_AFTER_MS) || 0);
+// With FAKE_CLAUDE_LOG_CAP_WORDS each showing goes to the runs log once it is
+// written out, so a test can count how many times ccx was shown the words.
+const logCapWords = Boolean(runsLog && process.env.FAKE_CLAUDE_LOG_CAP_WORDS);
 if (capEvery > 0) {
   const t = setInterval(() => {
     if (Date.now() < capFrom) return;
-    process.stdout.write("You have reached your Fable 5 limit. Run /usage-credits to continue.\n");
+    process.stdout.write("You have reached your Fable 5 limit. Run /usage-credits to continue.\n", () => {
+      if (logCapWords) appendFileSync(runsLog, `${JSON.stringify({ type: 'cap-words' })}\n`, 'utf8');
+    });
   }, capEvery);
   if (t.unref) t.unref();
 }
@@ -1030,7 +1047,18 @@ if (idleMs > 0) {
 } else {
   printResult(() => process.exit(endCode));
 }
-
+// Ended once a file the test names appears, the stay above being only a
+// backstop then: a test that must see something happen before Claude goes
+// ends it once it has, however slow the machine was to get there.
+const exitWhen = process.env.FAKE_CLAUDE_EXIT_WHEN;
+if (exitWhen && idleMs > 0) {
+  const t = setInterval(() => {
+    if (!existsSync(exitWhen)) return;
+    clearInterval(t);
+    printResult(() => process.exit(endCode));
+  }, 50);
+  if (t.unref) t.unref();
+}
 
 // Ordinary output with no limit in it. Used to prove a single cap message does
 // not keep re-matching from the rolling buffer as later output arrives.
