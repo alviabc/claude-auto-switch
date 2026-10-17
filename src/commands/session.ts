@@ -33,6 +33,7 @@ import {
   cappedNames,
   modelOnlyLimit,
   activeModelCaps,
+  accountCapEnd,
 } from '../ledger/ledger.js';
 import { readToken } from '../daemon/token-store.js';
 import { readReferenceConfig, onboardingFlags } from '../daemon/reference-config.js';
@@ -59,7 +60,9 @@ import {
   setTerminalOwnedElsewhere,
 } from '../launcher/notify.js';
 import { copyUserSettings, ensureSharedProjects, ensureSharedUserConfig } from '../session/shared-root.js';
-import { confirmSessionCap } from '../usage/confirm-cap.js';
+import { confirmSessionCap, usageAnswer, type SessionCapDecision } from '../usage/confirm-cap.js';
+import { refusalProof, type RecordedRefusal } from '../session/refused-turn.js';
+import { otherLiveWriter } from '../session/other-writers.js';
 import { resolveSessionIdentity, maskEmail } from '../session/session-identity.js';
 import { createTerminalWriter } from '../ui/terminal-writer.js';
 import { readUsageSnapshot, refreshUsage, renewIdleLogin, snapshotAgeMs } from '../usage/usage-store.js';
@@ -702,6 +705,22 @@ export async function runInteractiveHotSwap(
    * recorded.
    */
   let capUnregisteredEmail: string | null = null;
+  /**
+   * When the login under the running Claude was last replaced (a move, or a
+   * visit for an Artifact call), 0 before the first. A refusal Claude records
+   * soon after can be the old login's (session/refused-turn).
+   */
+  let loginChangedAt = 0;
+  /** Another live Claude ccx knows of on the conversation of `recorded`, in words, or null. */
+  const writerBesides = (recorded: RecordedRefusal): string | null =>
+    recorded.conversation === null
+      ? null
+      : otherLiveWriter(
+          recorded.conversation,
+          { sessionDir, claudePid: recorded.claudePid, configDirs: accounts.map((a) => a.dir) },
+          context.ctx,
+          context.isClaudeProcess ? { isClaude: context.isClaudeProcess } : {},
+        );
 
   /**
    * Tell the rotation how WIDE a limit was, so a spent model does not read as a
@@ -739,9 +758,15 @@ export async function runInteractiveHotSwap(
   // WHO the limit belongs to is resolved alongside, and the cap is recorded
   // against that account, never against the believed one on somebody else's
   // evidence.
-  const askAccountAboutCap = async (renderedText: string): Promise<boolean> => {
+  //
+  // `recorded`: the refused turn itself, when Claude's record of the
+  // conversation is where it was seen. When the usage check cannot answer
+  // (its budget is shared by every session on the machine), that record is
+  // the evidence the screen is not, if it proves the limit on its own.
+  const askAccountAboutCap = async (renderedText: string, recorded?: RecordedRefusal): Promise<boolean> => {
     let verdict: string;
     let refusalData: EventDetail['data'];
+    let decided: SessionCapDecision | null = null;
     if (context.verifyCap) {
       verdict = await context.verifyCap(renderedText);
       // The injected verifier answers yes or no and nothing else, so anything
@@ -760,8 +785,16 @@ export async function runInteractiveHotSwap(
         renderedText,
         // Scoped to what this session is actually running: a spent window for
         // a model it is not on is not a limit on it.
-        { modelInUse: runningModel(), ...(context.capProbe ? { probe: context.capProbe } : {}) },
+        {
+          modelInUse: runningModel(),
+          // Judged only once the usage check has no answer.
+          ...(recorded
+            ? { refusal: () => refusalProof({ ...recorded, otherWriter: () => writerBesides(recorded) }, loginChangedAt) }
+            : {}),
+          ...(context.capProbe ? { probe: context.capProbe } : {}),
+        },
       );
+      decided = decision;
       verdict = decision.limited ? 'limited' : 'allowed';
       limitedModel = decision.model;
       limitedResetAt = decision.resetAt;
@@ -785,6 +818,9 @@ export async function runInteractiveHotSwap(
         // and the log has to make that visible rather than print one of them.
         ...(running ? { running } : {}),
         ...(chosenModel ? { ccxChose: chosenModel } : {}),
+        seenIn: recorded ? 'record' : 'screen',
+        ...(decision.byRefusal ? { confirmedBy: 'refusal' } : {}),
+        ...(decision.asks !== undefined ? { asks: decision.asks } : {}),
       };
 
       // Recorded for the log only. Whether the session is STUCK is answered
@@ -821,6 +857,20 @@ export async function runInteractiveHotSwap(
           );
         }
       }
+      if (decision.byRefusal) {
+        // Until the reset the refusal names, which is this turn's own. Without
+        // one, the end already on the ledger for the account (another
+        // session's answered check, moments ago when the endpoint is this
+        // busy), and failing that the configured backoff.
+        const owner = capOwner ?? current?.name ?? '';
+        limitedResetAt =
+          decision.resetAt ?? (decision.model ? undefined : accountCapEnd(loadLedger(context.ctx), owner, Date.now()));
+        notice(
+          `the usage check could not answer (${usageAnswer(decision)}), ` +
+            `but ${decision.refusalWhy ?? 'Claude recorded the turn as refused'}, which confirms the limit`,
+          { kind: 'cap-verify', data: refusalData },
+        );
+      }
     }
     if (verdict !== 'limited') {
       // This fires whenever limit-looking text renders and the API refutes it,
@@ -832,8 +882,13 @@ export async function runInteractiveHotSwap(
       // spent on a model ccx does not believe this session is running, and that
       // reads as "the account is fine" to anyone watching. It sent the operator,
       // and me, looking in the wrong place for an hour.
+      // An unanswered check says what would settle it.
       notice(
-        `limit text on screen, but not switching: ${refusalReason ?? 'the API reported room'}`,
+        `${recorded ? 'Claude recorded a refused turn' : 'limit text on screen'}, but not switching` +
+          (decided?.unanswered
+            ? ` yet: the usage check could not answer (${usageAnswer(decided)}), ` +
+              `and ${decided.refusalWhy ?? 'Claude has not recorded the turn as refused'}`
+            : `: ${refusalReason ?? 'the API reported room'}`),
         { kind: 'cap-verify', ...(refusalData ? { data: refusalData } : {}) },
       );
     }
@@ -1154,6 +1209,7 @@ export async function runInteractiveHotSwap(
       },
     });
     current = account;
+    loginChangedAt = Date.now();
     // Every account a worker works on goes in its report, including one it
     // was moved to under a running launch, where no new launch says so. Not
     // one it only visits for an Artifact call: no work is done there.
@@ -1429,12 +1485,12 @@ export async function runInteractiveHotSwap(
    * this session. Counted, so a visit does not start while one is in flight
    * or a confirmed limit is still being acted on.
    */
-  const verifyCap = async (renderedText: string): Promise<boolean> => {
+  const verifyCap = async (renderedText: string, recorded?: RecordedRefusal): Promise<boolean> => {
     if (hop.away()) return false;
     const startedAt = Date.now();
     capChecks += 1;
     try {
-      const limited = await askAccountAboutCap(renderedText);
+      const limited = await askAccountAboutCap(renderedText, recorded);
       if (limited) {
         capConfirmedAt = Date.now();
         limitMetOn = capOwner ?? current?.name ?? null;
@@ -2352,6 +2408,12 @@ export async function runInteractiveHotSwap(
        * long for a command line, goes in by standard input.
        */
       const launchChild = (childArgs: string[], stdin?: string): Promise<SessionOutcome> => {
+        // Which conversation this launch is in, kept in this session's own
+        // folder for another session deciding a limit on it (session/other-writers);
+        // Claude's own word replaces it as it comes. A fork's is not known
+        // until Claude says it.
+        const launched = forksConversation(childArgs) ? null : conversationIdIn(childArgs);
+        if (launched) rememberReport(sessionDir, { id: launched });
         if (!worker) return runPtySession({ ...base, args: childArgs });
         // Ended: nothing starts, and what the last launch printed stays as it was.
         if (interruption?.exitCode != null) {

@@ -116,7 +116,19 @@ wins.
 
 **Detecting a spent account.** Claude writes every refused turn into the
 conversation's transcript, with error codes. ccx reads that record, never the
-screen, and confirms against the account's real usage before it acts. Text on
+screen, and confirms against the account's real usage before it acts. When the
+usage check cannot answer (its budget is shared by every session on the
+machine), only one kind of refusal confirms it instead: one Claude recorded
+for the current turn with the code for a spent usage limit
+(`usage_limit_reached`) and a limit it can name. It holds as wide as that
+limit, the whole account or one model, until the reset the refusal names.
+When it names none, an account-wide limit keeps the end another session
+already recorded for the account, if there is one; anything else takes the
+configured backoff. Any other refusal waits for the usage check, and even the
+right one never counts while ccx knows of another live Claude on the same
+conversation, since every Claude on a conversation writes to the same record.
+That covers sessions in the terminal, workers and `claude -p` runs whose
+conversation is named or reported in JSON, not yet the editor launch. Text on
 screen that talks about usage limits never moves a session.
 
 **Moving.** A refused turn has already ended, so the session needs another

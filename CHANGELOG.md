@@ -4,6 +4,68 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.9]
+
+### Fixed
+
+- **A session that hits a usage limit moves to another account even when
+  ccx's own usage check is turned away.** ccx confirms a limit with
+  Anthropic's usage endpoint before it moves a session. That endpoint has a
+  small budget shared by every session on the machine, so it answers 429
+  exactly when many sessions are busy, which is also when limits are met. ccx
+  then treated the limit as unproven and left the session at Claude's "wait or
+  upgrade" menu, although other accounts had room (#140). Now:
+  - When the usage check cannot answer (a 429, another error, no answer in
+    time, or no login to ask with), Claude's own record of the refused turn
+    confirms the limit. A session in the terminal moves in place as it does for
+    any confirmed limit, a worker moves on to the next account, and so does a
+    `claude -p` run through ccx.
+  - The record says which limit it was and when it resets
+    (`rate_limit_info`, written by Claude 2.1.292 and later). The session or
+    weekly limit is the whole account's; the Opus, Sonnet or Fable limit is
+    that model's only, so the session changes model and the account goes on
+    with the others. A limit ccx does not know the name of still waits for the
+    usage check. The account, or the model, is held until the reset the
+    refusal names.
+  - Only a refusal that speaks for the turn in front of the session counts:
+    one recorded with the API's code for a spent usage limit
+    (`usage_limit_reached`), after this Claude started, after the last prompt
+    typed at it, no more than 2 minutes ago, for a limit that has not reset
+    since. After ccx changes the login under a running Claude, a refusal in the
+    next 40 seconds counts only when its turn began at least 30 seconds after
+    the change: Claude keeps a login it has read for up to 30 seconds, and a
+    request sent on it is answered a little later. That lets the carry-on
+    prompt's own refusal count when the account it moved to is out too.
+  - Every Claude on a conversation writes to its one record, so a refusal
+    never counts while ccx knows of another live Claude on the same
+    conversation: another ccx session in it, or any Claude whose own
+    per-process record names it (a Claude started by hand, Claude Desktop,
+    or an editor launch). A record a killed Claude left behind does not count
+    once its pid belongs to a process started later. A Claude that keeps its
+    records anywhere else is not seen. For a worker and a `claude -p` run the
+    refusal must also be in the run's own output.
+  - So a session handed off from Claude Desktop in `same` mode waits for the
+    usage check, as before, for as long as Desktop keeps its Claude on that
+    conversation.
+  - A `claude -p` run's own record is found by the conversation it names
+    (`--session-id`, `--resume`) or reports (`--output-format json` or
+    `stream-json`; a fork only by what it reports), and read from its end. Of
+    the refusals since the run started, the one it printed counts, and none
+    does when two read alike. A refused turn there now starts the check by
+    itself, since Claude's wording for one ("You've hit your session limit")
+    need not match the limit text ccx looks for.
+  - Covered: sessions in the terminal, workers, and `claude -p` runs through
+    ccx whose conversation is named or reported. Not covered yet: the editor
+    launch, a `claude -p` run with headless rotation turned off, a plain-text
+    `claude -p` run with no conversation flag, and the launch ccx falls back to
+    when no account has a login. Those still wait for the usage check.
+  - Words on the screen alone still never move a session.
+  - When the endpoint asks ccx to back off, ccx waits as long as it asks, up to
+    4 seconds from its first ask, and asks once more.
+  - `ccx history` says what confirmed the limit, or what the check is still
+    waiting on, for example "the usage check could not answer (status 429),
+    and Claude has not recorded the turn as refused".
+
 ## [2.6.8]
 
 ### Fixed

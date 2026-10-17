@@ -10,7 +10,8 @@ import { runCommand } from '../../src/commands/run.js';
 import { workerCommand, WORKER_CARRY_ON, type WorkerIo } from '../../src/commands/worker.js';
 import { getActive, setActive } from '../../src/state/active.js';
 import { loadConfig } from '../../src/config/config.js';
-import { leasePath } from '../../src/session/lease.js';
+import { leasePath, processIsAlive } from '../../src/session/lease.js';
+import { sessionDirFor } from '../../src/session/session-dir.js';
 import { saveLedger } from '../../src/ledger/ledger.js';
 import { writeSwitchRequest } from '../../src/state/switch-request.js';
 import { saveToken } from '../../src/daemon/token-store.js';
@@ -50,6 +51,9 @@ function makeContext(home: string, verifyCap: () => Promise<Verdict>, said: stri
     config: loadConfig(ctx),
     claude: { bin: process.execPath, prefixArgs: [fakeClaude] },
     verifyCap,
+    // The fake claude runs as `node`: counted as a Claude, so its own
+    // per-process record is weighed exactly as a real one's is.
+    isClaudeProcess: processIsAlive,
     out: (m) => said.push(m),
     err: (m) => said.push(m),
     json: false,
@@ -218,6 +222,8 @@ const TOUCHED = [
   'FAKE_CLAUDE_REFUSAL_ENDS_RUN',
   'FAKE_CLAUDE_REFUSE_AS',
   'FAKE_CLAUDE_SUBAGENT_REFUSE_AFTER_MS',
+  'FAKE_CLAUDE_STREAM_REFUSALS',
+  'FAKE_CLAUDE_RESUMED_IDLE_MS',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'CLAUDE_CODE_ENTRYPOINT',
   'CLAUDECODE',
@@ -700,6 +706,72 @@ describe('ccx worker (against fake-claude)', () => {
     // The failure A printed is not the answer; B's is.
     expect(answer).toMatchObject({ is_error: false, result: `done: ${WORKER_CARRY_ON}` });
     expect(answer.ccx.accounts).toEqual(['A', 'B']);
+  });
+
+  it('moves on when the usage check is turned away and Claude recorded the refusal', { timeout: 60_000 }, async () => {
+    // The usage endpoint's budget is shared by every session on the machine,
+    // so it answers 429 exactly when many are busy. Claude's own record of the
+    // refused turn then confirms the limit.
+    const { context, runsLog } = await setup(['A', 'B']);
+    delete context.verifyCap;
+    context.capProbe = (credentialsFile) =>
+      Promise.resolve(
+        (JSON.parse(readFileSync(credentialsFile, 'utf8')) as { account?: string }).account === 'A'
+          ? { verdict: 'unknown', detail: 'status 429' }
+          : { verdict: 'allowed' },
+      );
+    Object.assign(process.env, refusing(), { FAKE_CLAUDE_REFUSE_ON: 'A', FAKE_CLAUDE_REFUSAL_ENDS_RUN: '1' });
+    const seen = capture();
+    expect(await workerCommand(context, ['hi'], {}, [], seen.io)).toBe(0);
+    expect(launchesIn(runsLog).map((l) => l.marker)).toEqual(['A', 'B']);
+    const answer = JSON.parse(seen.out()) as { is_error: boolean; ccx: { accounts: string[] } };
+    expect(answer).toMatchObject({ is_error: false, ccx: { accounts: ['A', 'B'] } });
+  });
+
+  it('moves on a refusal held while another was checked, once the usage check is turned away', { timeout: 60_000 }, async () => {
+    // The first refusal's check is slow and finds room; the second, seen
+    // meanwhile, is held, then checked: turned away, and proved by Claude's
+    // own record and its own output.
+    const { context, runsLog } = await setup(['A', 'B']);
+    delete context.verifyCap;
+    const asked: string[] = [];
+    context.capProbe = async (credentialsFile) => {
+      const account = (JSON.parse(readFileSync(credentialsFile, 'utf8')) as { account?: string }).account ?? '?';
+      asked.push(account);
+      if (account !== 'A') return { verdict: 'allowed' };
+      if (asked.length === 1) {
+        await sleep(2500);
+        return { verdict: 'allowed', fiveHour: 0.5 };
+      }
+      return { verdict: 'unknown', detail: 'status 429' };
+    };
+    Object.assign(process.env, refusing(6000), {
+      FAKE_CLAUDE_REFUSE_ON: 'A',
+      FAKE_CLAUDE_REFUSE_AGAIN_AFTER_MS: '2000',
+      FAKE_CLAUDE_STREAM_REFUSALS: '1',
+      FAKE_CLAUDE_RESUMED_IDLE_MS: '600',
+    });
+    expect(await workerCommand(context, ['hi'], { output: 'stream-json' }, [], capture().io)).toBe(0);
+    expect(asked).toEqual(['A', 'A']);
+    expect(launchesIn(runsLog).map((l) => l.marker)).toEqual(['A', 'B']);
+  });
+
+  it('says which conversation it is in, in its own folder, for another session deciding a limit', { timeout: 60_000 }, async () => {
+    // Another session reads this to know a worker is on its conversation too
+    // (session/other-writers), from before the worker's Claude has said so.
+    const { context, runsLog } = await setup(['A']);
+    process.env.FAKE_CLAUDE_IDLE_MS = '3000';
+    const running = workerCommand(context, ['hi'], {}, [], capture().io);
+    let launch: Launch | undefined;
+    for (let i = 0; i < 200 && !launch; i++) {
+      launch = launchesIn(runsLog)[0];
+      if (!launch) await sleep(50);
+    }
+    const report = JSON.parse(
+      readFileSync(path.join(sessionDirFor(process.pid, context.ctx), 'claude-report.json'), 'utf8'),
+    ) as { id?: string };
+    expect(report.id).toBe(valueAfter(launch?.args ?? [], '--session-id'));
+    expect(await running).toBe(0);
   });
 
   it('fails with the answer Claude gave when every account runs out', { timeout: 60_000 }, async () => {

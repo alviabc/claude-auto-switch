@@ -1,6 +1,8 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { invokerArgs, type ClaudeInvoker } from '../invoker.js';
 import { createRefusalFollower, type Refusal } from '../session/transcript.js';
+import { REFUSAL_MAX_AGE_MS, type RecordedRefusal } from '../session/refused-turn.js';
+import { createOutputLog, SHOWN_WAIT_MS } from '../session/own-output.js';
 import { gateRefusals, type RefusalGate } from '../session/refusal-gate.js';
 import { matchesCapText, resetAtIn } from './cap-detect.js';
 import { scrubHostEnv } from './child-env.js';
@@ -39,8 +41,11 @@ export interface HeadlessSessionOptions {
   switchWatch?: (restartBlocker: () => RestartBlocker | null) => string | null;
   /** As runPtySession's: kept running for as long as Claude is (leases, logins). */
   onTick?: () => void;
-  /** Resolves true only when the account is really out (asked of the account). */
-  verifyCap?: (renderedText: string) => Promise<boolean>;
+  /**
+   * Resolves true only when the account is really out (asked of the account).
+   * `recorded`: the refused turn itself, when it was read from the record.
+   */
+  verifyCap?: (renderedText: string, recorded?: RecordedRefusal) => Promise<boolean>;
   /** As runPtySession's: resolves true only when the login is confirmed finished. */
   verifySignedOut?: () => Promise<boolean>;
   ignoreLimits?: boolean;
@@ -230,9 +235,15 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
   );
   let recordReadable = false;
   let tail = '';
+  /** This run's own output, to tell its refusals from another Claude's in the same record (session/own-output). */
+  const output = createOutputLog({ keepMs: REFUSAL_MAX_AGE_MS + 10_000, maxChars: 512_000 });
   const keep = (chunk: string): void => {
     tail = (tail + chunk).slice(-TAIL);
+    output.add(chunk, Date.now());
   };
+  /** Claude prints a refused turn as it records it, a moment either side. */
+  const printed = (refusal: Refusal): boolean =>
+    refusal.at !== null && output.shows(refusal.text, refusal.at - 3_000);
   // Decoded as a stream: a character split between two reads arrives whole,
   // where decoding each read alone turns both halves into replacement marks.
   child.stdout?.setEncoding('utf8');
@@ -254,7 +265,14 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
   /** The confirmation in flight; the outcome waits for it, within VERIFY_WAIT_MS. */
   let verifying: Promise<void> | null = null;
   /** A refusal seen while another was being confirmed: asked about next, not dropped. */
-  let held: { text: string; hit: Hit } | null = null;
+  let held: { text: string; hit: Hit; refusal?: Refusal } | null = null;
+  /**
+   * The last refusal from the record that would have proved the limit but
+   * for this run not having printed it yet. Its output can arrive just after
+   * the record does, so once Claude has exited and all of its output is in,
+   * it is asked about again.
+   */
+  let askedBeforePrinted: { text: string; hit: Hit; refusal: Refusal } | null = null;
   /** What Claude showed when its login was turned away, once confirmed finished; and a check in flight. */
   let signedOut: string | null = null;
   let checkingLogin: Promise<void> | null = null;
@@ -272,13 +290,38 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
    * new question is asked once the worker is being ended; one already asked
    * still counts when it comes back.
    */
-  const evidence = (text: string, hit: Hit): void => {
+  const evidence = (text: string, hit: Hit, refusal?: Refusal): void => {
     if (options.ignoreLimits || capped || switchTo || interruptedBy !== null) return;
     if (verifying) {
-      held = { text, hit };
+      held = { text, hit, ...(refusal ? { refusal } : {}) };
       return;
     }
-    const check = options.verifyCap ? options.verifyCap(text) : Promise.resolve(true);
+    // Asked last, once all else about the refusal holds (session/refused-turn),
+    // so a refusal kept for another look is one its output alone was missing
+    // for. The record can be read a moment before the output arrives.
+    const shown = async (seen: Refusal): Promise<boolean> => {
+      const until = Date.now() + SHOWN_WAIT_MS;
+      while (!printed(seen)) {
+        if (Date.now() >= until || exited) {
+          askedBeforePrinted = { text, hit, refusal: seen };
+          return false;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return true;
+    };
+    // Nobody types at a headless Claude, so no prompt can come after a refusal.
+    const recorded: RecordedRefusal | undefined = refusal
+      ? {
+          refusal,
+          launchedAt: startedAt,
+          promptAt: 0,
+          conversation,
+          claudePid: child.pid ?? null,
+          shown: () => shown(refusal),
+        }
+      : undefined;
+    const check = options.verifyCap ? options.verifyCap(text, recorded) : Promise.resolve(true);
     verifying = check
       .then((confirmed) => {
         if (confirmed && !switchTo) {
@@ -293,7 +336,7 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
         verifying = null;
         const next = held;
         held = null;
-        if (next) evidence(next.text, next.hit);
+        if (next) evidence(next.text, next.hit, next.refusal);
       });
   };
 
@@ -339,7 +382,7 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
       // own next request, which is the refusal the run ends on.
       if (refusal.sidechain) continue;
       const { text, hit } = hitOf(refusal);
-      evidence(text, hit);
+      evidence(text, hit, refusal);
     }
   };
 
@@ -389,6 +432,9 @@ export function runHeadlessSession(options: HeadlessSessionOptions): Promise<Ses
       // A refusal written just before Claude exited is read now, and the
       // output stands in for the record only when there was none to read.
       checkRecord();
+      const again = askedBeforePrinted;
+      askedBeforePrinted = null;
+      if (again && printed(again.refusal)) evidence(again.text, again.hit, again.refusal);
       if (
         !capped &&
         !switchTo &&

@@ -4,7 +4,7 @@
 // Behavior is driven by a scenario JSON, resolved from FAKE_CLAUDE_SCENARIO or
 // <CLAUDE_CONFIG_DIR>/fake-scenario.json. No network, no model spend, no logins.
 import { readFileSync, writeFileSync, writeSync, existsSync, mkdirSync, appendFileSync, rmSync, statSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 
 const args = process.argv.slice(2);
@@ -166,12 +166,13 @@ if (runsLog) {
     'utf8',
   );
 }
+/** The conversation this run is in, which print mode reports as Claude does, flag or none. */
 const printSession = () => {
   for (const flag of ['--session-id', '--resume']) {
     const i = args.indexOf(flag);
     if (i >= 0 && args[i + 1]) return args[i + 1];
   }
-  return null;
+  return process.env.FAKE_CLAUDE_LANDS_ON ?? '00000000-0000-4000-8000-000000000000';
 };
 /**
  * The answer a print-mode run gives as it ends normally, then `done`. Only
@@ -308,9 +309,33 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
     valueAfter('--resume') ??
     process.env.FAKE_CLAUDE_LANDS_ON ??
     '00000000-0000-4000-8000-000000000000';
+  // When this process started, as Claude 2.1.302 records it off Windows
+  // (`LC_ALL=C TZ=UTC ps -o lstart= -p <pid>`), to tell it from a later
+  // process given the same pid.
+  let procStart;
+  if (process.platform !== 'win32') {
+    try {
+      const ps = spawnSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], {
+        encoding: 'utf8',
+        timeout: 1000,
+        env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
+      });
+      if (ps.status === 0 && ps.stdout.trim() !== '') procStart = ps.stdout.trim();
+    } catch {
+      /* written without one, as an older Claude does */
+    }
+  }
   const writeRecord = (sessionId) => {
     recordedId = sessionId;
-    writeJson(record, { pid: process.pid, sessionId, cwd: process.cwd(), startedAt, kind: 'interactive', ...doing });
+    writeJson(record, {
+      pid: process.pid,
+      sessionId,
+      cwd: process.cwd(),
+      startedAt,
+      ...(procStart ? { procStart } : {}),
+      kind: 'interactive',
+      ...doing,
+    });
   };
   const setStatus = (status) => {
     if (!status) return;
@@ -353,15 +378,40 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
   };
   const refusedOn = (marker) =>
     (process.env.FAKE_CLAUDE_REFUSE_ON ?? '').split(',').filter(Boolean).includes(marker ?? '');
-  /** A refused turn as Claude writes one; a subagent's carries its own marks. */
+  /**
+   * A refused turn as Claude writes one for an account out of its usage limit:
+   * "usage_limit_reached" is the API's code for it from 2.1.292 on (measured
+   * up to 2.1.302). A subagent's carries its own marks. With
+   * FAKE_CLAUDE_REFUSAL_AGE_MS it carries a time that long ago, as an entry
+   * copied into a new record from an older one (a fork, a record Claude
+   * wrote again) still carries its own.
+   */
+  /**
+   * The limit a refusal names, as Claude 2.1.29x writes it: its type
+   * (FAKE_CLAUDE_LIMIT_TYPE, five_hour by default) and when it resets in
+   * epoch seconds (FAKE_CLAUDE_RESETS_AT, an hour on by default, "none" for
+   * no time).
+   */
+  const rateLimitInfo = () => {
+    const resets = process.env.FAKE_CLAUDE_RESETS_AT;
+    return {
+      status: 'rejected',
+      rateLimitType: process.env.FAKE_CLAUDE_LIMIT_TYPE ?? 'five_hour',
+      ...(resets === 'none' ? {} : { resetsAt: resets ? Number(resets) : Math.floor(Date.now() / 1000) + 3600 }),
+      overageStatus: 'rejected',
+      overageDisabledReason: 'org_level_disabled',
+      isUsingOverage: false,
+    };
+  };
   const refusalEntry = (extra = {}) => ({
     type: 'assistant',
     isSidechain: false,
     isApiErrorMessage: true,
     error: 'rate_limit',
-    apiError: 'model_requires_usage_credits',
+    apiError: 'usage_limit_reached',
     apiErrorStatus: 429,
-    timestamp: new Date().toISOString(),
+    apiErrorParams: { rate_limit_info: rateLimitInfo() },
+    timestamp: new Date(Date.now() - (Number(process.env.FAKE_CLAUDE_REFUSAL_AGE_MS) || 0)).toISOString(),
     message: {
       model: '<synthetic>',
       role: 'assistant',
@@ -395,14 +445,49 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
     const transcript = path.join(configDir, 'projects', 'fake-project', `${recordedId}.jsonl`);
     mkdirSync(path.dirname(transcript), { recursive: true });
     appendFileSync(transcript, `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' } })}\n`);
+    /**
+     * A limit refusal of its own, shown as Claude shows one: in its terminal,
+     * or, with FAKE_CLAUDE_STREAM_REFUSALS, as an event in stream-json. One
+     * another Claude writes into the same record is never shown here.
+     */
+    const showRefusal = (entry) => {
+      const text = entry.message.content[0].text;
+      if (!outputFormat && process.env.FAKE_CLAUDE_DRAW_BY_CELLS) {
+        // As Claude 2.1.302 draws: only the cells that changed, each moved to
+        // in turn, here from the last to the first, so the text never goes
+        // out in order.
+        const row = 12;
+        for (let i = text.length - 1; i >= 0; i--) process.stdout.write(`\x1b[${row};${i + 3}H${text[i]}`);
+      } else if (!outputFormat) process.stdout.write(`${text}\n`);
+      else if (outputFormat === 'stream-json' && process.env.FAKE_CLAUDE_STREAM_REFUSALS) {
+        process.stdout.write(`${JSON.stringify({ type: 'assistant', message: entry.message, session_id: printSession() })}\n`);
+      }
+    };
+    // A prompt somebody typed, recorded at a set time, as Claude records one.
+    const promptAfter = Number(process.env.FAKE_CLAUDE_PROMPT_AFTER_MS) || 0;
+    if (promptAfter > 0) {
+      const t = setTimeout(() => {
+        const prompt = {
+          type: 'user',
+          isSidechain: false,
+          origin: { kind: 'human' },
+          timestamp: new Date().toISOString(),
+          message: { role: 'user', content: 'and one more thing' },
+        };
+        appendFileSync(transcript, `${JSON.stringify(prompt)}\n`);
+      }, promptAfter);
+      if (t.unref) t.unref();
+    }
     // Only on the accounts named, when some are: an account with room does
     // not refuse.
     const refuseOn = process.env.FAKE_CLAUDE_REFUSE_ON;
     const refusesHere = !refuseOn || refuseOn.split(',').includes(readMarker() ?? '');
     const refuse = () => {
       if (!refusesHere) return;
-      const entry = process.env.FAKE_CLAUDE_REFUSE_AS === 'signed-out' ? signedOutEntry() : refusalEntry();
+      const signedOut = process.env.FAKE_CLAUDE_REFUSE_AS === 'signed-out';
+      const entry = signedOut ? signedOutEntry() : refusalEntry();
       appendFileSync(transcript, `${JSON.stringify(entry)}\n`);
+      if (!signedOut) showRefusal(entry);
       // Print mode ends the run on a refused turn, with an error result and
       // exit 1, where the terminal app stays up and waits.
       if (process.env.FAKE_CLAUDE_REFUSAL_ENDS_RUN && outputFormat) {
@@ -515,6 +600,7 @@ if (process.env.FAKE_CLAUDE_SESSION_RECORD) {
                 message: { role: 'assistant', content: [{ type: 'text', text: 'carrying on' }] },
               };
           appendFileSync(transcript, `${JSON.stringify(answer)}\n`);
+          if (refused) showRefusal(answer);
           turnRunning = false;
           setStatus(resting);
           if (!refused) answered += 1;

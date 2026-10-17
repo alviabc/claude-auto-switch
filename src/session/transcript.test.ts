@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createRefusalFollower, findTranscript, refusalIn, signedOutIn } from './transcript.js';
+import { createRefusalFollower, findTranscript, refusalIn, refusalsSince, signedOutIn } from './transcript.js';
 
 const ID = '11111111-2222-4333-8444-555555555555';
 
@@ -52,6 +52,17 @@ describe('what counts as a refused turn', () => {
     expect(refusalIn(answered)).toBeNull();
     expect(refusalIn(refused({ error: 'overloaded', apiErrorStatus: 529 }))).toBeNull();
     expect(refusalIn('nope')).toBeNull();
+  });
+
+  it("reads which limit it was and when it resets, in Claude's own names for them", () => {
+    const named = refused({
+      apiErrorParams: { rate_limit_info: { status: 'rejected', rateLimitType: 'seven_day_opus', resetsAt: 1792677600 } },
+    });
+    expect(refusalIn(named)).toMatchObject({ limitType: 'seven_day_opus', resetsAt: 1792677600_000 });
+    expect(refusalIn(refused())).not.toHaveProperty('limitType');
+    const garbled = refused({ apiErrorParams: { rate_limit_info: { rateLimitType: 7, resetsAt: 'soon' } } });
+    expect(refusalIn(garbled)).not.toHaveProperty('limitType');
+    expect(refusalIn(garbled)).not.toHaveProperty('resetsAt');
   });
 
   it('says when a subagent was the one refused', () => {
@@ -438,5 +449,53 @@ describe('a turn refused because the login no longer works', () => {
     const follow = createRefusalFollower(dir);
     expect(follow.poll(ID).signedOut).toBeNull();
     expect(follow.poll(ID).signedOut).toBeNull();
+  });
+});
+
+describe('the refused turns of a run that has ended', () => {
+  it("are the main thread's, written since the run started, newest first", () => {
+    const { dir, file } = config();
+    mkdirSync(path.dirname(file), { recursive: true });
+    const at = (iso: string) => ({ timestamp: iso });
+    writeFileSync(
+      file,
+      line(refused(at('2026-10-16T10:00:00.000Z'))) +
+        line(answered) +
+        line(refused(at('2026-10-16T12:00:00.000Z'))) +
+        line(refused({ ...at('2026-10-16T12:00:01.000Z'), isSidechain: true })) +
+        line(refused(at('2026-10-16T12:00:02.000Z'))) +
+        // No time: nothing says it is this run's.
+        line(refused()),
+    );
+    const since = Date.parse('2026-10-16T11:00:00.000Z');
+    expect(refusalsSince(dir, ID, since).map((r) => r.at)).toEqual([
+      Date.parse('2026-10-16T12:00:02.000Z'),
+      Date.parse('2026-10-16T12:00:00.000Z'),
+    ]);
+  });
+
+  it("reads back from the end, across chunks and a line longer than one, only as far as the run's start", () => {
+    const { dir, file } = config();
+    mkdirSync(path.dirname(file), { recursive: true });
+    const said = (iso: string, text: string) => ({ type: 'assistant', timestamp: iso, message: { content: [{ type: 'text', text }] } });
+    const long = 'y'.repeat(1_200_000);
+    const record = [
+      line(refused({ timestamp: '2026-10-16T10:00:00.000Z' })),
+      line(said('2026-10-16T11:30:00.000Z', 'x'.repeat(1000))).repeat(1500),
+      line(refused({ timestamp: '2026-10-16T12:00:00.000Z', message: { content: [{ type: 'text', text: long }] } })),
+      line(said('2026-10-16T12:30:00.000Z', 'x'.repeat(1000))).repeat(1500),
+      line(refused({ timestamp: '2026-10-16T13:00:00.000Z' })),
+    ].join('');
+    writeFileSync(file, record);
+    const found = refusalsSince(dir, ID, Date.parse('2026-10-16T11:00:00.000Z'));
+    expect(found.map((r) => r.at)).toEqual([
+      Date.parse('2026-10-16T13:00:00.000Z'),
+      Date.parse('2026-10-16T12:00:00.000Z'),
+    ]);
+    expect(found[1]?.text).toHaveLength(long.length);
+  });
+
+  it('are none for a conversation with no record', () => {
+    expect(refusalsSince(config().dir, ID, 0)).toEqual([]);
   });
 });
