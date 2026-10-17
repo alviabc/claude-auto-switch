@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [2.6.16]
+
+### Fixed
+
+- **An editor chat through `ccx-claude` moves the editor off a spent account
+  while the chat is still open, even while ccx's usage check is turned away
+  (#153).** One Claude answers every turn of an editor chat and ends only when
+  the chat closes, and ccx looked only at its standard error then, long after
+  a refusal stops speaking for the turn in front of it. ccx now follows that
+  Claude's own records while it runs, as it does a terminal session's: the
+  conversation from the per-process record Claude keeps in the account's
+  folder (a new chat, a resumed one, and a `/clear` inside one process), and
+  that conversation's record as it grows. A turn refused for a spent limit is
+  judged by the same rules as in a terminal: a limit Claude names, newer than
+  this Claude's start and its last typed prompt, not yet reset, and no other
+  live Claude on the conversation. A confirmed limit is recorded on the ledger
+  and the editor's active account moves, once per limit: a retried turn, or
+  limit text on standard error at the end about a limit the record already
+  proved, records nothing again. A resumed chat's record is read from where it
+  ended at launch, since the extension starts Claude to send a turn at once.
+- **What the editor counts as already recorded is the ledger's word.** An
+  editor's Claude outlives a limit's reset, so a chat that meets the limit
+  again after it is checked and recorded again, and so are its closing words.
+  A refused turn the check found no limit behind holds the next ones back for
+  20 s, by the same rule as a terminal session (`session/check-backoff`), so
+  each retried turn no longer asks the shared usage endpoint again; one held
+  back is asked about as Claude exits. A refusal held back is judged on the
+  conversation it was read from, so a `/clear` meanwhile cannot hide another
+  live Claude on it, one held for the whole account is no longer pushed out
+  by a later one for one model, and none is left unasked behind one the
+  ledger has meanwhile come to hold.
+- **`ccx-claude` finishes a check under way when the extension ends it.** The
+  extension sends SIGTERM 2 s after it closes a chat whose wrapper still runs,
+  and SIGKILL 5 s later. The wrapper now passes SIGTERM on to Claude while it
+  runs, gives a check under way 4 s to be written down, and then ends; before,
+  Node ended it at once and the limit was lost. Windows gets no SIGTERM from
+  the extension, only the SIGKILL.
+- **One follower and one judgement for every launch.** The terminal session and
+  the editor now follow Claude's records through one piece
+  (`session/record-watch`), and the terminal, the editor and `claude -p` judge
+  a refused turn, other live writers included, through one function
+  (`judgeRefusal`). The terminal's pause after a check that confirms nothing
+  now comes from the same piece the editor uses (`session/check-backoff`).
+  The terminal and `claude -p` behave as before.
+
 ## [2.6.15]
 
 ### Fixed

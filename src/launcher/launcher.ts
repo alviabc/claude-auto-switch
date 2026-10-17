@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { runInherit, runCapture, type RunOptions, type RunResult } from '../util/exec.js';
 import { invokerArgs, type ClaudeInvoker } from '../invoker.js';
 import { classifyRun, type CapClassification } from './cap-detect.js';
@@ -118,20 +118,23 @@ export async function launchWatched(
   args: string[],
   account: LaunchTarget,
   deps: LaunchDeps,
+  started?: (child: ChildProcess) => void,
 ): Promise<WatchedResult> {
   const argv = invokerArgs(deps.claude, args);
-  return spawnWatched(deps.claude.bin, argv, { CLAUDE_CONFIG_DIR: account.dir });
+  return spawnWatched(deps.claude.bin, argv, { CLAUDE_CONFIG_DIR: account.dir }, started);
 }
 
 /**
  * Spawn any command with inherited stdin/stdout (transparent) while teeing and
  * watching stderr for the rate-limit signal. Used to run claude directly AND to
- * run an editor's exact "run this" command on a chosen account.
+ * run an editor's exact "run this" command on a chosen account. `started` is
+ * given the process as soon as it has a pid.
  */
 export async function spawnWatched(
   bin: string,
   args: string[],
   extraEnv: Record<string, string> = {},
+  started?: (child: ChildProcess) => void,
 ): Promise<WatchedResult> {
   const child = spawn(bin, args, {
     // On the account ccx chose: a login variable inherited from wherever ccx
@@ -139,6 +142,7 @@ export async function spawnWatched(
     env: { ...withoutEnv(process.env, ACCOUNT_ENV), ...extraEnv },
     stdio: ['inherit', 'inherit', 'pipe'],
   });
+  if (child.pid !== undefined) started?.(child);
 
   let stderr = '';
   // Decoded as a stream, so a character split between two reads stays whole.
