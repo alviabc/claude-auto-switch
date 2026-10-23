@@ -64,8 +64,41 @@ it is closed. When a chat closes, a check still under way gets 4 s to be written
 down. The extension has Claude write its debug log to standard error: ccx passes
 all of it to the editor, never reads it as a limit, and keeps only the last
 65,536 characters of the rest. `ccx on` and `ccx editor on` work differently:
-they point the editor's `CLAUDE_CONFIG_DIR` at the active account, and no ccx
-process runs beside the editor's Claude.
+the editor runs on a folder of its own (below), and no ccx process runs beside
+its Claude.
+
+**The editor's own folder.** `ccx on` and `ccx editor on` set the editor's
+`CLAUDE_CONFIG_DIR` to `~/.claude-auto-switch/editor-active`, a folder built
+like a session's: your projects, settings, memory, skills, agents and commands,
+with only the login its own. A switch (`ccx use`, the dashboard, a session
+moving) replaces that login in place, only while the locks Claude takes are
+free and never past them, so an open editor chat carries on on the next account
+at its next message. On macOS the login goes into the Keychain item Claude
+names after the folder as the editor's setting spells it. The folder never
+ends, so at every switch, `ccx on`, `ccx editor on`, `ccx doctor` and session
+start ccx syncs it with your files both ways: what the editor changed goes into
+your `settings.json`, `~/.claude.json` and memory, what you changed comes in,
+and where both changed one setting yours wins and the editor's copy goes to
+`rescued/`. A limit met inside an editor chat is not noticed by itself yet; the
+editor moves when ccx switches.
+
+`ccx editor off` hands back what the folder holds, saves its login home and
+removes it. While an editor chat started through it is open, or something in it
+cannot be handed back, it stays, and ccx retires it at a later event. A folder
+at that path that ccx did not make is taken over once no editor chat is open in
+it, its chats and files kept, and `ccx editor on` says when it could not set
+the editor up.
+
+**Moving an older install.** ccx used to point the editor at a link to the
+active account's own folder. The first switch or session start after updating
+replaces the link with the folder, at the same path, so the editor's setting
+does not change. The chats and checkpoints in every account folder are merged
+into your `~/.claude` (hard links; nothing is moved or deleted), prompts your
+history lacks are added, and an account folder's own settings, memory,
+keybindings and Claude choices that are not yours go to `rescued/`. A login the
+editor's Claude kept in a Keychain item of its own (#129) goes home to its
+account. While an editor chat started through the link is open, the move waits,
+for up to a day.
 
 **Detecting a finished login.** A login can be revoked long before its stored
 expiry: signed out at claude.ai, or the account put on hold. ccx asks Anthropic
@@ -88,10 +121,8 @@ menu (`/rate-limit-options`) and waits there; after a move ccx closes that menu
 so the carry-on prompt can be typed, and answers no other dialog. When the next account's login is due for
 renewal, ccx renews it first and then moves in place, unless another session may
 be using that login, since renewing it would sign that session out. Your editor
-being on it does not stop this: Claude renews a login under the same lock ccx
-takes, and reads it again under it. (On macOS, once the editor's Claude has
-saved a login it keeps it in a Keychain item of its own and no longer follows
-the account ccx points it at: #129.)
+being on it does not stop this: ccx renews it under the editor folder's lock as
+well, and writes the renewal into that folder.
 When every account looks out of room, ccx moves the session in place to the
 account a relaunch would have started it on anyway, and says so, because that
 judgement is cached and can be wrong. It never guesses its way onto an account

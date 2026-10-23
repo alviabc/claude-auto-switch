@@ -77,9 +77,10 @@ usage check, as `ccx config <key>` says.
 | ---------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `~/.claude-auto-switch/profiles/<name>/` | each account's login, owner-only (separate Keychain entries on macOS)                        |
 | `~/.claude-auto-switch/sessions/<pid>/`  | per-session config folders, cleared after the session ends                                   |
+| `~/.claude-auto-switch/editor-active/`   | the editor's config folder: your setup linked in, its own login (a Keychain item on macOS)   |
 | `~/.claude-auto-switch/config.json`      | your settings                                                                                |
 | `~/.claude-auto-switch/events.jsonl`     | what ccx did (`ccx history`)                                                                 |
-| `~/.claude-auto-switch/rescued/`         | session changes that could not be merged back                                                |
+| `~/.claude-auto-switch/rescued/`         | session and editor changes that could not be merged back; account folders' own files         |
 | `~/.claude-auto-switch/artifacts.jsonl`  | each page a session published while page routing was on, and its owner                       |
 | `~/.claude/settings.json`                | the `statusLine` key; the Desktop hooks and the Artifact hooks when enabled; session changes |
 | `~/.claude.json`                         | session changes to your preferences, MCP servers and folder trust                            |

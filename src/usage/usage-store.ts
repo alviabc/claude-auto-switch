@@ -12,6 +12,8 @@ import { probeUsage, type LimitProbeResult } from './limit-probe.js';
 import { learnWindowCost } from './runway.js';
 import { refreshCredentialIfExpired, renewalIsDue, expiredLongerThan, type RefreshOutcome } from './oauth-refresh.js';
 import { editorPointerAccount } from '../editor/junction.js';
+import { takeUpEditorRenewal } from '../editor/folder.js';
+import { retryEditorCarries } from '../editor/folder-login.js';
 import { isOnHold, reportFinishedLogin } from '../accounts/login-check.js';
 
 /**
@@ -190,6 +192,8 @@ export interface IdleRenewalOptions {
   renew?: (accountDir: string) => Promise<RefreshOutcome>;
   /** The account the editor points at, when the caller has already looked. */
   editorAccount?: string | null;
+  /** Injected in tests: the API lookup of who a login belongs to (editor/folder takeUpEditorRenewal). */
+  lookupOwner?: (dir: string) => Promise<string | null>;
 }
 
 /**
@@ -208,6 +212,13 @@ export async function renewIdleLogin(
   const renew = options.renew ?? ((accountDir: string) => refreshCredentialIfExpired(accountDir, { ctx: c }));
   const editorAccount =
     options.editorAccount !== undefined ? options.editorAccount : editorPointerAccount(accounts, c);
+  // The editor's own folder may hold a newer copy of this login than the
+  // profile, renewed there by its Claude: it comes home first, since renewing
+  // the profile's would spend a token that renewal has already retired.
+  const editorCopy = await takeUpEditorRenewal(c, {
+    account: account.name,
+    ...(options.lookupOwner ? { lookupOwner: options.lookupOwner } : {}),
+  });
 
   // Two reasons never to renew, both of which END a login rather than
   // refreshing it. In both cases only the RENEWAL is skipped, not the
@@ -273,7 +284,9 @@ export async function renewIdleLogin(
       ? `not renewed: a session is using ${inSessionNow.join(', ')}; renewing would sign it out`
       : editorMayBeUsingIt
         ? 'not renewed: your editor is pointed at a profile that shares this login and may be using it'
-        : null;
+        : editorCopy === 'unconfirmed'
+          ? "not renewed: your editor holds a newer copy of this login, which ccx could not yet confirm is this account's"
+          : null;
   const mayRenew = refusal === null;
   if (refusal && renewalIsDue(account.dir)) {
     logCredentialEvent({ account: account.name, kind: 'refused', detail: refusal }, c);
@@ -286,9 +299,7 @@ export async function renewIdleLogin(
   // Carrying into a contaminated holder is what made contamination
   // permanent.
   const { result: renewal, carried } = mayRenew
-    ? await renewAndCarry(account, accounts, carryTargets(account, accounts), () =>
-        renew(account.dir),
-      )
+    ? await renewAndCarry(account, accounts, carryTargets(account, accounts), () => renew(account.dir))
     : { result: { status: 'not-needed' as const }, carried: [] as string[] };
   // A renewal another caller started is logged by that caller.
   if (renewal.status === 'refreshed' && !renewal.alreadyKnown) {
@@ -341,6 +352,9 @@ export async function refreshUsage(
     ((accountDir: string, rejected?: string) =>
       refreshCredentialIfExpired(accountDir, { ctx: c, ...(rejected ? { renewRejected: rejected } : {}) }));
 
+  // A renewal that could not be written into the editor's folder: every tick
+  // looks, fresh entries or not, since its Claude would send the retired token.
+  await retryEditorCarries(c);
   const snapshot = readUsageSnapshot(c);
   const aged = accounts.filter((a) => {
     const entry = snapshot.accounts[a.name];

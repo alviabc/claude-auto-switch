@@ -6,7 +6,8 @@
 
 - a `claude` function that runs Claude through ccx, in every shell you use
   (see [which shells](#which-shells))
-- the Claude Code extension in Cursor and VS Code
+- the Claude Code extension in Cursor and VS Code, on a config folder of its
+  own (see [the editor's own folder](how-it-works.md#moving-a-session))
 - ccx's part of Claude's status line (an existing status line is kept, wrapped)
 - the `/ccx` command inside Claude
 

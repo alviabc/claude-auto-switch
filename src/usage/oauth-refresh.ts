@@ -7,6 +7,13 @@ import { renewOneAtATime } from './renew-one-at-a-time.js';
 import { sha256Fingerprint } from '../util/fingerprint.js';
 import { alreadyRefused, refusalReason, rememberRefused } from './dead-login-memo.js';
 import { loginIsKnownDead, deadLoginReason, rememberDeadLogin, forgetDeadLogin } from './dead-login-store.js';
+import {
+  editorHolding,
+  queueEditorCarry,
+  replaceFolderLogin,
+  retryEditorCarriesSoon,
+  type FolderLogin,
+} from '../editor/folder-login.js';
 import type { PathCtx } from '../config/paths.js';
 
 /**
@@ -68,6 +75,12 @@ export interface RefreshOptions {
   lockWaitMs?: number;
   /** How long the token request may take (default REQUEST_TIMEOUT_MS). */
   requestTimeoutMs?: number;
+  /**
+   * How long a renewal whose write into the editor's folder failed keeps
+   * trying it before leaving it to the next look (default
+   * EDITOR_CARRY_SOON_MS); 0 in a test that waits for that look.
+   */
+  editorCarrySoonMs?: number;
   /**
    * The fingerprint of an access token the API just turned away (401). The
    * login is then renewed however long its stored expiry says it has left,
@@ -142,7 +155,68 @@ export async function refreshCredentialIfExpired(
   // Looked at first without the lock, so a login with nothing to do never waits for it.
   const before = assess(credentialPath(accountDir), now, options.ctx, options.renewRejected);
   if (!before.renew) return before.outcome;
-  return oneRenewalPerLogin(sha256Fingerprint(before.refreshToken), () => renewUnderLock(accountDir, options));
+  const login = sha256Fingerprint(before.refreshToken);
+  return oneRenewalPerLogin(login, () => {
+    // Only with a ctx: without one, ccx's own folders are not to be looked in.
+    const editor = options.ctx ? editorHolding(login, options.ctx) : null;
+    // Whether the editor holds it cannot be told, so it may: renewing without
+    // its lock could spend a token its Claude is renewing, or leave it on one retired.
+    if (editor === 'unreadable') {
+      return Promise.resolve<RefreshOutcome>({
+        status: 'busy',
+        detail: "the editor's login could not be read, so nothing was sent",
+      });
+    }
+    return editor ? renewWithEditor(accountDir, options, editor, login) : renewUnderLock(accountDir, options);
+  });
+}
+
+/**
+ * Renew a login the editor's folder holds too: under that folder's lock as well
+ * as the profile's, for the whole renewal, and written into the folder before
+ * its lock is let go, which is how the old link to the profile kept the two
+ * apart. A folder lock held by the editor's Claude means it is renewing the
+ * login itself, so nothing is sent.
+ *
+ * The request gets its usual time: one the server answered but ccx gave up on
+ * loses the login with the token it spent. Claude 2.1.302 renews only within 5
+ * minutes of expiry (`KC`), ccx 10 minutes ahead (EXPIRY_BUFFER_MS), so on
+ * schedule the two never meet. When they do, its refresh tries the lock five
+ * times, 1 to 2 s apart, then watches the lock's time for up to 7.5 s; ccx
+ * touches its lock every 3 s, so Claude finds it busy, not abandoned, sends
+ * nothing and goes on with the token it has, and its next look reads ccx's
+ * renewal from the folder.
+ */
+async function renewWithEditor(
+  accountDir: string,
+  options: RefreshOptions,
+  editor: FolderLogin,
+  retired: string,
+): Promise<RefreshOutcome> {
+  const lock = acquireLockDir(path.join(editor.dir, CREDENTIALS_LOCK_DIR), { waitMs: 0 });
+  if (lock.unusable) {
+    return { status: 'unavailable', detail: `the editor folder's lock could not be created (${lock.unusable})` };
+  }
+  if (!lock.held) return { status: 'busy', detail: 'your editor is renewing this login' };
+  try {
+    const outcome = await renewUnderLock(accountDir, options);
+    if (outcome.status === 'refreshed') {
+      try {
+        replaceFolderLogin(editor, retired, readCredential(credentialPath(accountDir)));
+      } catch {
+        // The editor is left on the token this renewal retired, which its
+        // Claude would send at its own renewal and be signed out. Tried again
+        // here for a while, then by whatever of ccx looks next.
+        if (options.ctx) {
+          queueEditorCarry(options.ctx, retired, accountDir);
+          void retryEditorCarriesSoon(options.ctx, options.editorCarrySoonMs);
+        }
+      }
+    }
+    return outcome;
+  } finally {
+    lock.release();
+  }
 }
 
 const oneRenewalPerLogin = renewOneAtATime();

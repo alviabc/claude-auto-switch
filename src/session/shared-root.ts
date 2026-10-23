@@ -1,13 +1,19 @@
 import {
   appendFileSync,
+  type BigIntStats,
+  closeSync,
+  constants as fsConstants,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   renameSync,
   linkSync,
   copyFileSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -15,6 +21,7 @@ import {
 import path from 'node:path';
 import { configHome, homeDir, type PathCtx } from '../config/paths.js';
 import { writeFileAtomic } from '../util/atomic-write.js';
+import { writeSecretFile } from '../util/secret-file.js';
 import { setTarget, isLink } from '../daemon/junction.js';
 
 /**
@@ -113,7 +120,14 @@ const KNOWN_SHARED_DIRS = [
  */
 const OWN_DIRS = new Set(['backups', 'projects']);
 
-/** The folders a session links to ~/.claude: the known ones, and whatever else is there. */
+/**
+ * A lock Claude or ccx holds as a folder (`.oauth_refresh.lock` and the like):
+ * each Claude folder's own, never shared or merged, since a link to another
+ * folder's would hand one Claude's lock to another.
+ */
+const isLockFolder = (name: string): boolean => name.endsWith('.lock');
+
+/** The folders a session links to ~/.claude: the known ones, and whatever else is there but locks. */
 export function sharedDirNames(root: string): string[] {
   const names = new Set(KNOWN_SHARED_DIRS);
   try {
@@ -125,7 +139,7 @@ export function sharedDirNames(root: string): string[] {
   } catch {
     /* no ~/.claude yet: the known ones */
   }
-  return [...names].filter((n) => !OWN_DIRS.has(n));
+  return [...names].filter((n) => !OWN_DIRS.has(n) && !isLockFolder(n));
 }
 
 const lstatOrNull = (p: string): ReturnType<typeof lstatSync> | null => {
@@ -183,15 +197,15 @@ const baseOf = (sessionDir: string, name: string): string => path.join(sessionDi
  * session appends to it, and replacing it would drop a line one of them wrote
  * meanwhile. What cannot go back, or must not because the user changed
  * the same file meanwhile, is kept in `rescued/` in the ccx folder instead.
- * False only when even that failed: the session folder must then stay,
- * because it holds the only copy.
+ * False when even that failed, or there is no ~/.claude to hand back to: the
+ * session folder must then stay, because it holds the only copy.
  */
 export function returnSharedUserFiles(sessionDir: string, c: PathCtx = {}): boolean {
   let root: string;
   try {
     root = defaultClaudeRoot(c);
   } catch {
-    return true;
+    return false; // with no ~/.claude to link to, the session's folder holds all it made
   }
   let kept = true;
   for (const { name, merge } of SHARED_FILES) {
@@ -226,16 +240,17 @@ export function returnSharedUserFiles(sessionDir: string, c: PathCtx = {}): bool
   // A folder that should have been a link but is the session's own (one made
   // before it was shared, or a link that could not be made) is merged in,
   // never over what is there: /rewind checkpoints and todos made in it go
-  // on being found. Plugins are not: an install is the user's own to manage.
+  // on being found, and the session folder stays while one cannot be.
+  // Plugins are not: an install is the user's own to manage.
   for (const name of sharedDirNames(root)) {
     if (name === 'plugins' || name === 'sessions') continue;
     const own = path.join(sessionDir, name);
     try {
       if (!existsSync(own) || isLink(own) || !lstatSync(own).isDirectory()) continue;
       mkdirSync(path.join(root, name), { recursive: true });
-      mergeTree(own, path.join(root, name));
+      if (!mergeTree(own, path.join(root, name))) kept = false;
     } catch {
-      /* best effort, as at the start */
+      kept = false;
     }
   }
   return kept;
@@ -326,7 +341,18 @@ export function rescue(from: string, name: string, c: PathCtx): boolean {
   }
 }
 
-export function ensureSharedUserConfig(sessionDir: string, c: PathCtx = {}): void {
+/** Keep `text` in `rescued/` as `name`, owner-only, since it can hold a setting's secret. False when that failed. */
+export function rescueText(text: string, name: string, c: PathCtx): boolean {
+  try {
+    writeSecretFile(path.join(configHome(c), 'rescued', `${Date.now()}-${name}`), text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Link every folder of ~/.claude into `sessionDir` (ensureSharedDir): the known ones, and whatever else is there. */
+export function linkSharedDirs(sessionDir: string, c: PathCtx = {}): void {
   let root: string;
   try {
     root = defaultClaudeRoot(c);
@@ -334,6 +360,16 @@ export function ensureSharedUserConfig(sessionDir: string, c: PathCtx = {}): voi
     return;
   }
   for (const name of sharedDirNames(root)) ensureSharedDir(sessionDir, name, c);
+}
+
+export function ensureSharedUserConfig(sessionDir: string, c: PathCtx = {}): void {
+  let root: string;
+  try {
+    root = defaultClaudeRoot(c);
+  } catch {
+    return;
+  }
+  linkSharedDirs(sessionDir, c);
   for (const { name, merge } of SHARED_FILES) {
     const from = path.join(root, name);
     const to = path.join(sessionDir, name);
@@ -373,29 +409,137 @@ function latestBackup(sessionDir: string, name = 'projects'): string {
   return last ? path.join(sessionDir, last) : '';
 }
 
-/** Merge src into dest without overwriting anything that already exists. */
-function mergeTree(src: string, dest: string): void {
-  if (!src || !existsSync(src)) return;
+/** Where src and dest both have a file: true once it is dealt with, false when it could not be. */
+type Clash = (from: string, to: string, relative: string) => boolean;
+
+/**
+ * Merge src into dest, never over what is there: where both have a file,
+ * `clash` decides, and without one dest's stays. False when something in src
+ * could not be merged, so a caller can try again.
+ */
+function mergeTree(src: string, dest: string, clash?: Clash, relative = ''): boolean {
+  if (!src || !existsSync(src)) return true;
+  let merged = true;
   for (const entry of readdirSync(src)) {
     const from = path.join(src, entry);
     const to = path.join(dest, entry);
+    const rel = path.join(relative, entry);
     try {
       const st = lstatSync(from);
       if (st.isSymbolicLink()) continue; // never follow links out of the tree
       if (st.isDirectory()) {
         mkdirSync(to, { recursive: true });
-        mergeTree(from, to);
-      } else if (!existsSync(to)) {
-        try {
-          linkSync(from, to); // same volume: hardlink shares bytes, no copy cost
-        } catch {
-          copyFileSync(from, to);
-        }
+        if (!mergeTree(from, to, clash, rel)) merged = false;
+      } else if (!placeFile(from, to) && clash && !clash(from, to, rel)) {
+        merged = false;
       }
     } catch {
-      /* skip unreadable entries; merge the rest */
+      if (lstatOrNull(from)) merged = false; // one gone since it was listed has nothing to merge
     }
   }
+  return merged;
+}
+
+/** Put `from` at `to`, a hard link where the volume allows, else a copy. False when `to` is already there. */
+function placeFile(from: string, to: string): boolean {
+  try {
+    linkSync(from, to);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+  }
+  try {
+    copyFileSync(from, to, fsConstants.COPYFILE_EXCL);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
+/** Whether the first `length` bytes of two files are the same. */
+function sameStart(a: string, b: string, length: bigint): boolean {
+  const total = Number(length);
+  const fa = openSync(a, 'r');
+  try {
+    const fb = openSync(b, 'r');
+    try {
+      const chunk = 64 * 1024;
+      const ba = Buffer.alloc(chunk);
+      const bb = Buffer.alloc(chunk);
+      for (let at = 0; at < total; at += chunk) {
+        const want = Math.min(chunk, total - at);
+        if (readSync(fa, ba, 0, want, at) !== want || readSync(fb, bb, 0, want, at) !== want) return false;
+        if (!ba.subarray(0, want).equals(bb.subarray(0, want))) return false;
+      }
+      return true;
+    } finally {
+      closeSync(fb);
+    }
+  } finally {
+    closeSync(fa);
+  }
+}
+
+/** The bytes of `file` from `start` to `end`. */
+function readRange(file: string, start: bigint, end: bigint): Buffer {
+  const out = Buffer.alloc(Number(end - start));
+  const fd = openSync(file, 'r');
+  try {
+    if (readSync(fd, out, 0, out.length, Number(start)) !== out.length) throw new Error(`${file} is shorter than it was`);
+  } finally {
+    closeSync(fd);
+  }
+  return out;
+}
+
+const bigStatOrNull = (p: string): BigIntStats | null => {
+  try {
+    return statSync(p, { bigint: true });
+  } catch {
+    return null;
+  }
+};
+
+/** Keep `from` at `base` (or `base-2` and on), once: a later pass finds it there and keeps no second copy. */
+function keepFileAside(from: string, base: string): boolean {
+  mkdirSync(path.dirname(base), { recursive: true });
+  const size = statSync(from, { bigint: true }).size;
+  let at = base;
+  for (let i = 2; lstatOrNull(at); i += 1) {
+    const there = bigStatOrNull(at);
+    if (sameFile(from, at) || (there?.isFile() && there.size === size && sameStart(from, at, size))) return true;
+    at = `${base}-${i}`;
+  }
+  return placeFile(from, at);
+}
+
+/**
+ * Where an account folder's tree and the user's both have a file: nothing to
+ * do when the user's holds all of the account's; where the account's is the
+ * user's and more, as a chat that ran on where the old link led leaves it, the
+ * rest is added; otherwise the user's stays and the account's is kept in
+ * `rescued/<label>/`.
+ */
+function adoptClash(label: string, c: PathCtx): Clash {
+  return (from, to, relative) => {
+    try {
+      const theirs = statSync(from, { bigint: true });
+      const yours = bigStatOrNull(to); // through a link a dotfiles setup made
+      if (yours?.isFile()) {
+        if (theirs.ino === yours.ino && theirs.dev === yours.dev) return true;
+        if (theirs.size <= yours.size && sameStart(from, to, theirs.size)) return true;
+        // Never written to through a link: that file is not ccx's to grow.
+        if (theirs.size > yours.size && !isLink(to) && sameStart(from, to, yours.size)) {
+          appendFileSync(to, readRange(from, yours.size, theirs.size));
+          return true;
+        }
+      }
+      return keepFileAside(from, path.join(configHome(c), 'rescued', label, relative));
+    } catch {
+      return false;
+    }
+  };
 }
 
 /**
@@ -440,4 +584,230 @@ function readJson(file: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+/** How a change goes into one of the user's own files: under ccx's write-back lock, as `plan` says then (write-back writeUserFile). */
+export type UserFileWriter = (
+  file: string,
+  plan: () => { text: string; append?: boolean } | null,
+) => 'written' | 'unchanged' | 'failed';
+
+/**
+ * Bring a long-lived folder's copies of the user's files (SHARED_FILES) into
+ * step with the user's, both ways, and make each the user's file again.
+ *
+ * They are hard links, one file, until something saves one by writing a new
+ * file in its place; then the two have drifted apart. They are compared as a
+ * session's hand-back compares them (planWhole against the folder's base, or
+ * the history's missing lines), what goes back is written into the user's file,
+ * an edit both sides made is kept in `rescued/` while the user's stays, and the
+ * folder's becomes a link to the user's again, its base moved to it. The
+ * folder's copy is moved aside first, so a write Claude makes to it meanwhile
+ * lands in a new file, which the next sync takes up, rather than being lost.
+ * True when every file is in step.
+ */
+export function syncSharedFiles(dir: string, c: PathCtx, writeUser: UserFileWriter): boolean {
+  let root: string;
+  try {
+    root = defaultClaudeRoot(c);
+  } catch {
+    return true;
+  }
+  let inStep = true;
+  for (const { name, merge } of SHARED_FILES) {
+    try {
+      if (!syncSharedFile(dir, root, name, merge, c, writeUser)) inStep = false;
+    } catch {
+      inStep = false;
+    }
+  }
+  return inStep;
+}
+
+function syncSharedFile(
+  dir: string,
+  root: string,
+  name: string,
+  merge: 'whole' | 'lines',
+  c: PathCtx,
+  writeUser: UserFileWriter,
+): boolean {
+  const mine = path.join(dir, name);
+  const theirs = path.join(root, name);
+  if (!lstatOrNull(mine)) return takeTheirs(dir, name, merge, theirs, mine);
+  if (existsSync(theirs) && sameFile(mine, theirs)) return true;
+  const aside = uniquePath(`${mine}.ccx-sync`);
+  renameSync(mine, aside);
+  let keepAside = false;
+  const outcome = writeUser(theirs, () => {
+    if (merge === 'lines') {
+      const added = missingLines(aside, theirs);
+      return added === null ? null : { text: added, append: true };
+    }
+    const plan = planWhole(aside, theirs, baseOf(dir, name));
+    keepAside = plan.keepAside;
+    return plan.write === null ? null : { text: plan.write };
+  });
+  if (outcome === 'failed' || (keepAside && !rescue(aside, name, c))) {
+    // Put back as it was, so nothing in it is lost; one Claude wrote meanwhile is newer, and stays.
+    if (!lstatOrNull(mine)) renameSync(aside, mine);
+    else if (rescue(aside, name, c)) rmSync(aside, { force: true });
+    return false;
+  }
+  rmSync(aside, { force: true });
+  // Written meanwhile: the user's file has what was aside, and the next sync compares the new one.
+  if (lstatOrNull(mine)) return false;
+  return takeTheirs(dir, name, merge, theirs, mine);
+}
+
+/** The folder's copy of `name` becomes the user's file again, and what both agree on is its base. */
+function takeTheirs(dir: string, name: string, merge: 'whole' | 'lines', theirs: string, mine: string): boolean {
+  if (existsSync(theirs)) {
+    try {
+      linkSync(theirs, mine);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+      copyFileSync(theirs, mine);
+    }
+  }
+  if (merge === 'whole') writeFileAtomic(baseOf(dir, name), existsSync(theirs) ? readFileSync(theirs, 'utf8') : '');
+  return true;
+}
+
+/**
+ * Bring what an account's own folder holds of the user's Claude into the
+ * user's ~/.claude, from when the editor ran there: its chats, checkpoints and
+ * other folders merged in (never over what is there, hard links where the
+ * volume allows, so nothing is copied and the account folder keeps its own;
+ * a file both have is settled by adoptClash), and the prompts the user's
+ * history lacks. With `rescueFiles`, its own
+ * settings, memory and keybindings that are not the user's are kept in
+ * `rescued/` rather than applied. False when the history or a folder could
+ * not be merged, or there is no ~/.claude to merge into, so the caller can try
+ * again.
+ */
+export function adoptFolderHistory(
+  folder: string,
+  label: string,
+  c: PathCtx,
+  writeUser: UserFileWriter,
+  rescueFiles: boolean,
+): boolean {
+  let root: string;
+  try {
+    root = defaultClaudeRoot(c);
+  } catch {
+    return false; // no ~/.claude to merge into yet: tried again later
+  }
+  let merged = true;
+  for (const name of ['projects', ...sharedDirNames(root)]) {
+    // Another Claude's install, live records and editor links are no history.
+    if (name === 'plugins' || name === 'sessions' || name === 'ide') continue;
+    const own = path.join(folder, name);
+    try {
+      if (!existsSync(own) || isLink(own) || !lstatSync(own).isDirectory()) continue;
+      mkdirSync(path.join(root, name), { recursive: true });
+      if (!mergeTree(own, path.join(root, name), adoptClash(`${label}-${name}`, c))) merged = false;
+    } catch {
+      merged = false; // the rest still merge
+    }
+  }
+  const history = path.join(folder, 'history.jsonl');
+  const theirs = path.join(root, 'history.jsonl');
+  if (existsSync(history) && !isLink(history)) {
+    const outcome = writeUser(theirs, () => {
+      const added = missingLines(history, theirs);
+      return added === null ? null : { text: added, append: true };
+    });
+    if (outcome === 'failed') merged = false;
+  }
+  if (!rescueFiles) return merged;
+  for (const name of ['settings.json', 'CLAUDE.md', 'keybindings.json']) {
+    const own = path.join(folder, name);
+    try {
+      if (!existsSync(own) || isLink(own)) continue;
+      const user = path.join(root, name);
+      if (existsSync(user) && readFileSync(own).equals(readFileSync(user))) continue;
+      if (!rescueOnce(own, `${label}-${name}`, c)) merged = false;
+    } catch {
+      merged = false; // not kept: a folder that is removed later must wait for it
+    }
+  }
+  return merged;
+}
+
+/** Whether `rescued/` already holds these bytes under `name`. */
+function keptAlready(bytes: Buffer, name: string, c: PathCtx): boolean {
+  let dir: string;
+  let entries: string[];
+  try {
+    dir = path.join(configHome(c), 'rescued');
+    entries = readdirSync(dir);
+  } catch {
+    return false;
+  }
+  return entries.some((entry) => {
+    if (!entry.endsWith(`-${name}`)) return false;
+    try {
+      return readFileSync(path.join(dir, entry)).equals(bytes);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** rescue(), unless `rescued/` already holds the same bytes under `name`: a pass run again keeps no second copy. */
+export function rescueOnce(from: string, name: string, c: PathCtx): boolean {
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(from);
+  } catch {
+    return false;
+  }
+  return keptAlready(bytes, name, c) || rescue(from, name, c);
+}
+
+/** rescueText(), unless `rescued/` already holds `text` under `name`. */
+export function rescueTextOnce(text: string, name: string, c: PathCtx): boolean {
+  return keptAlready(Buffer.from(text), name, c) || rescueText(text, name, c);
+}
+
+/** Claude's own backups of the folder's state, an install, live records and editor links: nothing to keep. */
+const NOT_KEPT_AT_REMOVAL = new Set(['backups', 'plugins', 'sessions', 'ide']);
+
+/**
+ * Before a long-lived Claude folder is removed, bring into ~/.claude every
+ * folder it holds of its own rather than by link, by adoptFolderHistory's rule
+ * for a file both have: one its Claude made that ~/.claude did not have, and
+ * one moved aside when it was linked (`<name>.pre-share`). False when one
+ * could not be merged, so the folder must stay.
+ */
+export function returnOwnFolders(dir: string, label: string, c: PathCtx): boolean {
+  let root: string;
+  try {
+    root = defaultClaudeRoot(c);
+  } catch {
+    return false; // with no ~/.claude to link to, the folder holds everything of its own
+  }
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return false;
+  }
+  let merged = true;
+  for (const entry of entries) {
+    const own = path.join(dir, entry);
+    const aside = entry.indexOf('.pre-share');
+    const name = aside > 0 ? entry.slice(0, aside) : entry;
+    if (NOT_KEPT_AT_REMOVAL.has(name) || isLockFolder(name)) continue;
+    try {
+      if (isLink(own) || !lstatSync(own).isDirectory()) continue;
+      mkdirSync(path.join(root, name), { recursive: true });
+      if (!mergeTree(own, path.join(root, name), adoptClash(`${label}-${name}`, c))) merged = false;
+    } catch {
+      merged = false;
+    }
+  }
+  return merged;
 }
