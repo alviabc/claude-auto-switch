@@ -31,6 +31,7 @@ import { renewIdleLogin } from '../usage/usage-store.js';
 import { listAccounts } from '../accounts/registry.js';
 import { readKeychainCredential } from '../accounts/keychain.js';
 import type { CliContext } from '../context.js';
+import { takeUpEditorRenewal } from './folder.js';
 
 /**
  * The editor's Claude folder, end to end through the commands that set it up
@@ -41,16 +42,25 @@ import type { CliContext } from '../context.js';
  */
 
 const keychain = vi.hoisted(() => new Map<string, string>());
-vi.mock('../accounts/keychain.js', () => ({
-  keychainService: (dir: string) => `Claude Code-credentials-${dir}`,
-  readKeychainCredential: vi.fn((dir: string) => keychain.get(dir) ?? null),
-  writeKeychainCredential: vi.fn((dir: string, text: string) => {
+vi.mock('../accounts/keychain.js', () => {
+  const read = vi.fn((dir: string) => keychain.get(dir) ?? null);
+  const write = vi.fn((dir: string, text: string) => {
     keychain.set(dir, text);
-  }),
-  deleteKeychainCredential: vi.fn((dir: string) => {
+  });
+  const remove = vi.fn((dir: string) => {
     keychain.delete(dir);
-  }),
-}));
+  });
+  return {
+    keychainService: (dir: string) => `Claude Code-credentials-${dir}`,
+    readKeychainCredential: read,
+    writeKeychainCredential: write,
+    deleteKeychainCredential: remove,
+    // Off the thread, the same Keychain: what a test stages on the blocking form holds here too.
+    readKeychainCredentialAsync: async (dir: string) => read(dir),
+    writeKeychainCredentialAsync: async (dir: string, text: string) => write(dir, text),
+    deleteKeychainCredentialAsync: async (dir: string) => remove(dir),
+  };
+});
 
 const HOURS = 3_600_000;
 const emailOf = (name: string): string => `${name.toLowerCase()}@example.com`;
@@ -1237,5 +1247,30 @@ describe('ccx editor off', () => {
     expect(await editorCommand(s.context, 'off')).toBe(1);
 
     expect(isRealFolder(s.folder)).toBe(true);
+  });
+});
+
+describe("a renewal the editor's Claude made, saved home from a running session", () => {
+  it('neither waits for, nor writes past, the lock of a profile sharing that login', async () => {
+    const s = await scene();
+    await editorOn(s);
+    // C is a second profile on A's login, as signing in twice leaves, and
+    // another ccx is changing C's login right now.
+    await addCommand(s.context, 'C', { dir: s.dirOf('C'), login: false });
+    mkdirSync(s.dirOf('C'), { recursive: true });
+    writeFileSync(path.join(s.dirOf('C'), '.credentials.json'), login('A', 1));
+    mkdirSync(path.join(s.dirOf('C'), '.oauth_refresh.lock'));
+    writeFileSync(path.join(s.folder, '.credentials.json'), login('A', 2));
+
+    const started = Date.now();
+    const took = await takeUpEditorRenewal(s.context.ctx, {
+      ...(s.context.lookupOwner ? { lookupOwner: s.context.lookupOwner } : {}),
+      lockWaitMs: 0,
+    });
+
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(took).toBe('taken');
+    expect(tokenOf(profileLogin(s, 'A'))).toBe('a-A-2');
+    expect(tokenOf(profileLogin(s, 'C'))).toBe('a-A-1');
   });
 });

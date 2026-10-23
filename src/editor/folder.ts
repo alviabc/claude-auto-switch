@@ -5,7 +5,7 @@ import type { Account } from '../accounts/registry.schema.js';
 import { getActive } from '../state/active.js';
 import { configHome, type PathCtx } from '../config/paths.js';
 import { readTarget, removeTarget, setTarget } from '../daemon/junction.js';
-import { acquireOwnedLock, CREDENTIALS_LOCK_DIR, lockDirHeld, withCredentialLockIfFree } from '../claude/locks.js';
+import { acquireOwnedLock, CREDENTIALS_LOCK_DIR, lockDirHeld, lockDirSteps, withCredentialLockIfFree } from '../claude/locks.js';
 import { CREDENTIALS_FILE, readCredential } from '../accounts/credential-storage.js';
 import {
   credentialFingerprint,
@@ -17,7 +17,7 @@ import {
   sessionIdentityEmail,
   usableLoginText,
 } from '../accounts/credential-vault.js';
-import { readKeychainCredential } from '../accounts/keychain.js';
+import { readKeychainItem } from '../accounts/keychain-view.js';
 import { loginExpiresAt, readExpiresAt } from '../usage/token-expiry.js';
 import { loginIsKnownDead } from '../usage/dead-login-store.js';
 import { sha256Fingerprint } from '../util/fingerprint.js';
@@ -156,8 +156,10 @@ export function editorStanding(context: CliContext): { name: string; loggedIn: b
  * calls it, where nothing would catch an error, and the editor following is not
  * worth ending a session.
  */
-export function moveEditorToActive(context: CliContext): Promise<EditorUp> {
-  return bringEditorUp(context, { move: true, setUp: false });
+export function moveEditorToActive(context: CliContext, from: { session?: boolean } = {}): Promise<EditorUp> {
+  // From a running session's thread, which relays Claude's terminal, ccx's
+  // own locks are tried once and the refresh left to the next event.
+  return bringEditorUp(context, { move: true, setUp: false, ...(from.session ? { lockWaitMs: 0 } : {}) });
 }
 
 /** Bring the editor's folder into step with the user's ~/.claude, without moving its account. */
@@ -181,7 +183,10 @@ export type EditorUp = { state: 'ready' } | { state: 'meanwhile'; why: string } 
 const EDITOR_MOVE_LOOK_MS = 200;
 const EDITOR_MOVE_RETRY_MS = 10_000;
 
-async function bringEditorUp(context: CliContext, how: { move: boolean; setUp: boolean }): Promise<EditorUp> {
+async function bringEditorUp(
+  context: CliContext,
+  how: { move: boolean; setUp: boolean; lockWaitMs?: number },
+): Promise<EditorUp> {
   const c = context.ctx;
   const dir = editorFolderPath(c);
   try {
@@ -227,17 +232,20 @@ async function bringEditorUp(context: CliContext, how: { move: boolean; setUp: b
       }
     }
     if (kind === 'missing' && !createEditorFolder(c)) return { state: 'not-ready', why: `${dir} could not be made` };
-    await takeUpEditorRenewal(c, context.lookupOwner ? { lookupOwner: context.lookupOwner } : {});
+    await takeUpEditorRenewal(c, {
+      ...(context.lookupOwner ? { lookupOwner: context.lookupOwner } : {}),
+      ...(how.lockWaitMs !== undefined ? { lockWaitMs: how.lockWaitMs } : {}),
+    });
     const refreshed = await underEditorLock(c, () => {
       finishLateMerge(c);
-      refreshClaudeFolder(dir, c);
+      refreshClaudeFolder(dir, c, {}, how.lockWaitMs);
       pullProfileIntoEditor(c);
       return true;
     });
     if (refreshed === null) return { state: 'not-ready', why: 'another ccx was changing the folder; run it again' };
     await underEditorLock(c, () => finishTakeOver(c));
     if (!how.move && !movePending(c)) return { state: 'ready' };
-    return await moveWithClaudesLocks(context);
+    return await moveWithClaudesLocks(context, how.lockWaitMs);
   } catch (error) {
     return { state: 'not-ready', why: error instanceof Error ? error.message : String(error) };
   }
@@ -249,11 +257,11 @@ async function bringEditorUp(context: CliContext, how: { move: boolean; setUp: b
  * EDITOR_MOVE_RETRY_MS, without holding up the thread, and then leaves the move
  * to ccx's next event (movePending).
  */
-async function moveWithClaudesLocks(context: CliContext): Promise<EditorUp> {
+async function moveWithClaudesLocks(context: CliContext, lockWaitMs?: number): Promise<EditorUp> {
   const c = context.ctx;
   const giveUpAt = Date.now() + (context.editorMoveRetryMs ?? EDITOR_MOVE_RETRY_MS);
   for (;;) {
-    const moved = await underEditorLock(c, () => moveEditorLogin(c));
+    const moved = await underEditorLock(c, () => moveEditorLogin(c, lockWaitMs));
     if (moved === null) return { state: 'not-ready', why: 'another ccx was changing the folder; run it again' };
     if (moved !== 'deferred') {
       clearMovePending(c);
@@ -376,7 +384,7 @@ function editorLoginStore(login: FolderLogin): FolderLoginStore {
  * that account's login is lost. 'deferred' when either is taken. The caller
  * holds the editor lock.
  */
-function moveEditorLogin(c: PathCtx): 'moved' | 'deferred' | 'not-needed' {
+function moveEditorLogin(c: PathCtx, lockWaitMs?: number): 'moved' | 'deferred' | 'not-needed' {
   const dir = editorFolderPath(c);
   const active = getActive(c);
   const to = active ? getAccount(active, c) : undefined;
@@ -401,7 +409,7 @@ function moveEditorLogin(c: PathCtx): 'moved' | 'deferred' | 'not-needed' {
   try {
     moved = moveFolderLogin(dir, to.dir, c, editorLoginStore(login), {
       leaving: () => {
-        if (leaving) saveEditorLoginHome(leaving, accounts, login, c);
+        if (leaving) saveEditorLoginHome(leaving, accounts, login, c, lockWaitMs);
       },
       installed: () => writeEditorRecord(dir, { account: to.name, loginChangedAt: Date.now() }),
       onlyUnderClaudesLocks: true,
@@ -424,16 +432,32 @@ const userFileWriter = (c: PathCtx): UserFileWriter => (file, plan) => writeUser
  * Write `text`, a login of `account`'s that the profile does not have, into its
  * profile from a private copy, carrying it to the profiles sharing the one it
  * replaces, as a session's save-back does (writeAndCarry). False, never a
- * throw, when it could not be written.
+ * throw, when it could not be written. `lockWaitMs`: how long a profile sharing
+ * the login is waited for; a running session's thread passes 0.
  */
-function installFromText(account: Account, accounts: Account[], text: string, c: PathCtx, detail: string): boolean {
+function installFromText(
+  account: Account,
+  accounts: Account[],
+  text: string,
+  c: PathCtx,
+  detail: string,
+  lockWaitMs?: number,
+): boolean {
   const snapshot = path.join(configHome(c), `.editor-login.${process.pid}.tmp`);
   try {
     writeSecretFile(snapshot, text);
     let installed = false;
-    writeAndCarry(account, accounts, carryTargets(account, accounts), () => {
-      installed = installCredential(account.dir, snapshot);
-    });
+    writeAndCarry(
+      account,
+      accounts,
+      carryTargets(account, accounts),
+      () => {
+        installed = installCredential(account.dir, snapshot);
+      },
+      lockWaitMs !== undefined
+        ? { lock: (dir: string) => lockDirSteps(path.join(dir, CREDENTIALS_LOCK_DIR), { waitMs: lockWaitMs }) }
+        : {},
+    );
     if (installed) logCredentialEvent({ account: account.name, kind: 'installed', detail }, c);
     return installed;
   } catch {
@@ -460,7 +484,13 @@ function newerThanStored(text: string, account: Account): boolean {
  * Claude renewed it there, by the rule a terminal session's move uses: only to
  * the account the folder says it is signed in as (decideSaveBack).
  */
-function saveEditorLoginHome(leaving: Account, accounts: Account[], login: FolderLogin, c: PathCtx): void {
+function saveEditorLoginHome(
+  leaving: Account,
+  accounts: Account[],
+  login: FolderLogin,
+  c: PathCtx,
+  lockWaitMs?: number,
+): void {
   // Throws when it cannot be read, or not saved home: what it holds may be a
   // renewal only it has, which a move would then write over.
   const text = readFolderLogin(login);
@@ -476,7 +506,7 @@ function saveEditorLoginHome(leaving: Account, accounts: Account[], login: Folde
     appendEvent(configHome(c), `the editor: ${decision.reason}`, Date.now(), { kind: 'credential-sync' });
     return;
   }
-  if (!installFromText(leaving, accounts, text, c, 'the editor renewed this login; saved home as the editor moved off it')) {
+  if (!installFromText(leaving, accounts, text, c, 'the editor renewed this login; saved home as the editor moved off it', lockWaitMs)) {
     throw new Error(`the editor's renewal of ${leaving.name}'s login could not be saved home`);
   }
 }
@@ -579,7 +609,12 @@ export type TakeUp = 'none' | 'taken' | 'unconfirmed';
  */
 export async function takeUpEditorRenewal(
   c: PathCtx,
-  options: { account?: string; lookupOwner?: (dir: string) => Promise<string | null> } = {},
+  options: {
+    account?: string;
+    lookupOwner?: (dir: string) => Promise<string | null>;
+    /** How long a profile sharing the login is waited for as a renewal is saved home; 0 from a running session. */
+    lockWaitMs?: number;
+  } = {},
 ): Promise<TakeUp> {
   // Once the folder is on this account, a failure to tell what it holds is no answer that it holds nothing.
   let mayHold = false;
@@ -622,7 +657,7 @@ export async function takeUpEditorRenewal(
       askedAbout.delete(asked);
       return 'none';
     }
-    if (installFromText(account, accounts, text, c, 'the editor renewed this login; saved home')) return 'taken';
+    if (installFromText(account, accounts, text, c, 'the editor renewed this login; saved home', options.lockWaitMs)) return 'taken';
     // Asked about again at the next look; meanwhile nothing renews the token that renewal retired.
     askedAbout.delete(asked);
     return 'unconfirmed';
@@ -697,7 +732,7 @@ function waitedLongEnough(c: PathCtx): boolean {
 function firstItem(login: FolderLogin): string | null {
   for (const spelling of login.spellings) {
     try {
-      const item = readKeychainCredential(spelling);
+      const item = readKeychainItem(spelling);
       if (item !== null) return item;
     } catch {
       /* the next spelling */
